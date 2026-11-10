@@ -1,0 +1,28 @@
+---
+- name: Verify nginx-wrong-api from the client perspective
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    verification_host: verification.incidentsim.test
+
+  tasks:
+    - name: Send a request through Nginx with a controlled Host header
+      ansible.builtin.uri:
+        url: http://127.0.0.1/
+        headers:
+          Host: "{{ verification_host }}"
+        return_content: true
+        status_code: 200
+      register: verification_response
+
+    - name: Require the application to receive the original Host header
+      ansible.builtin.assert:
+        that:
+          - verification_response.json.host == verification_host
+        success_msg: The original Host header reached the echo-server.
+        fail_msg: >-
+          Expected {{ verification_host }}, but the echo-server received
+          {{ verification_response.json.host | default('no host value') }}.

@@ -1,0 +1,6 @@
+# Contains workstation-specific SSH settings.
+incidentctl.json
+microvm.json
+
+# Local build output.
+/bin/

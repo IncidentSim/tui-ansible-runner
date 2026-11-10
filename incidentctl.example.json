@@ -1,0 +1,12 @@
+{
+  "target": {
+    "host": "incidentsim.orb.local",
+    "port": 22,
+    "user": "root",
+    "identity_file": "~/.orbstack/ssh/id_ed25519",
+    "strict_host_key_checking": true
+  },
+  "paths": {
+    "remote_work_dir": "/var/tmp/incidentctl/exercises"
+  }
+}
