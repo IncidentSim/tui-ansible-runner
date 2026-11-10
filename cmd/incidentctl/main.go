@@ -26,6 +26,14 @@ type connectionInfo struct {
 	IdentityFile string  `json:"identity_file"`
 }
 
+type playbookRunError struct {
+	Phase string
+	Err   error
+}
+
+func (e *playbookRunError) Error() string { return e.Phase + ": " + e.Err.Error() }
+func (e *playbookRunError) Unwrap() error { return e.Err }
+
 func main() {
 	os.Exit(run(os.Args[1:]))
 }
@@ -36,10 +44,22 @@ func run(args []string) int {
 	configPath := flags.String("config", "incidentctl.json", "path to the local JSON configuration")
 	flags.Usage = usage
 	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 2
 	}
 	rest := flags.Args()
-	if len(rest) == 0 || rest[0] == "help" || rest[0] == "-h" || rest[0] == "--help" {
+	if len(rest) == 0 || rest[0] == "tui" {
+		if len(rest) > 1 {
+			return fail(errors.New("tui does not accept arguments"))
+		}
+		if err := runTUI(*configPath); err != nil {
+			return fail(err)
+		}
+		return 0
+	}
+	if rest[0] == "help" || rest[0] == "-h" || rest[0] == "--help" {
 		usage()
 		return 0
 	}
@@ -94,6 +114,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `incidentctl — запуск incident exercises на готовой Linux VM
 
 Usage:
+  incidentctl [-config incidentctl.json] [tui]
   incidentctl [-config incidentctl.json] ssh-check
   incidentctl [-config incidentctl.json] connection
   incidentctl [-config incidentctl.json] infra    <exercise> [-- ansible-playbook args]
@@ -152,11 +173,14 @@ func runPlaybook(client *remote.Client, cfg config.Config, exercise config.Exerc
 		return err
 	}
 	if err := client.RunShellInput(uploadScript, bytes.NewReader(archive), cfg.Paths.RemoteWorkDir, exercise.Name); err != nil {
-		return fmt.Errorf("upload exercise: %w", err)
+		return &playbookRunError{Phase: "upload exercise", Err: err}
 	}
 	args := []string{cfg.Paths.RemoteWorkDir, exercise.Name, playbook}
 	args = append(args, extra...)
-	return client.RunScript(playbookScript, args...)
+	if err := client.RunScript(playbookScript, args...); err != nil {
+		return &playbookRunError{Phase: "execute playbook", Err: err}
+	}
+	return nil
 }
 
 func makeArchive(root string) ([]byte, error) {

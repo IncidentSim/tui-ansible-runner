@@ -22,16 +22,16 @@
         path: /etc/nginx/sites-available/incidentsim
         regexp: '^(\s*)proxy_set_header Host .+;$'
         replace: '\1proxy_set_header Host $proxy_host;'
-      notify: Reload Nginx
+      notify: Restart Nginx
 
   handlers:
     - name: Validate Nginx configuration
       ansible.builtin.command: /usr/sbin/nginx -t
       changed_when: false
-      listen: Reload Nginx
+      listen: Restart Nginx
 
-    - name: Reload Nginx service
-      ansible.builtin.service:
+    - name: Restart Nginx service
+      ansible.builtin.systemd_service:
         name: nginx
-        state: reloaded
-      listen: Reload Nginx
+        state: restarted
+      listen: Restart Nginx

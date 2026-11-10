@@ -23,6 +23,27 @@ func New(cfg config.TargetConfig) *Client {
 	return &Client{config: cfg, out: os.Stdout, errOut: os.Stderr}
 }
 
+// NewWithWriters creates a client whose remote output can be embedded in a UI
+// or captured by a caller instead of being written directly to the terminal.
+func NewWithWriters(cfg config.TargetConfig, out, errOut io.Writer) *Client {
+	return &Client{config: cfg, out: out, errOut: errOut}
+}
+
+// CommandError reports a non-zero exit status returned by the remote command.
+// Transport errors (for example, failing to start ssh) use a different error.
+type CommandError struct {
+	ExitCode int
+}
+
+func (e *CommandError) Error() string {
+	return fmt.Sprintf("remote command exited with code %d", e.ExitCode)
+}
+
+func IsCommandError(err error) bool {
+	var commandErr *CommandError
+	return errors.As(err, &commandErr)
+}
+
 func (c *Client) RunScriptOutput(script string, args ...string) (string, error) {
 	var output bytes.Buffer
 	cmd := c.command(c.scriptCommand(args...))
@@ -98,7 +119,7 @@ func describe(err error) error {
 		return nil
 	}
 	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
-		return fmt.Errorf("remote command exited with code %d", exitErr.ExitCode())
+		return &CommandError{ExitCode: exitErr.ExitCode()}
 	}
 	return fmt.Errorf("run ssh: %w", err)
 }
