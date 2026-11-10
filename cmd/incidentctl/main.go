@@ -3,6 +3,7 @@ package main
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -13,6 +14,7 @@ import (
 
 	"incidentctl/internal/config"
 	"incidentctl/internal/remote"
+	"incidentctl/internal/vm"
 )
 
 const exerciseRoot = "exersice"
@@ -41,7 +43,12 @@ func main() {
 func run(args []string) int {
 	flags := flag.NewFlagSet("incidentctl", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
-	configPath := flags.String("config", "incidentctl.json", "path to the local JSON configuration")
+	configPath := flags.String("config", "incidentctl.json", "path to the direct VM configuration")
+	vmProviderName := flags.String("vm-provider", "direct", "VM provider: direct or microvm-service")
+	microVMConfigPath := flags.String("microvm-service-config", "microvm-service.json", "path to the microVM service configuration")
+	exerciseSourceName := flags.String("exercise-source", "local", "exercise source: local or git")
+	exerciseRootPath := flags.String("exercise-root", exerciseRoot, "path to the local exercise directory")
+	exerciseRepositoryConfigPath := flags.String("exercise-repository-config", "exercise-repository.json", "path to the Git exercise source configuration")
 	flags.Usage = usage
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -50,25 +57,29 @@ func run(args []string) int {
 		return 2
 	}
 	rest := flags.Args()
-	if len(rest) == 0 || rest[0] == "tui" {
-		if len(rest) > 1 {
-			return fail(errors.New("tui does not accept arguments"))
-		}
-		if err := runTUI(*configPath); err != nil {
-			return fail(err)
-		}
-		return 0
-	}
-	if rest[0] == "help" || rest[0] == "-h" || rest[0] == "--help" {
+	if len(rest) > 0 && (rest[0] == "help" || rest[0] == "-h" || rest[0] == "--help") {
 		usage()
 		return 0
 	}
 
-	cfg, err := config.Load(*configPath)
+	source, err := buildExerciseSource(*exerciseSourceName, *exerciseRootPath, *exerciseRepositoryConfigPath)
 	if err != nil {
 		return fail(err)
 	}
-	client := remote.New(cfg.Target)
+	provider, remoteWorkDir, providerErr := buildConnectionProvider(*vmProviderName, *configPath, *microVMConfigPath)
+	if len(rest) == 0 || rest[0] == "tui" {
+		if len(rest) > 1 {
+			return fail(errors.New("tui does not accept arguments"))
+		}
+		if err := runTUI(source, provider, remoteWorkDir, providerErr); err != nil {
+			return fail(err)
+		}
+		return 0
+	}
+	if providerErr != nil {
+		return fail(providerErr)
+	}
+	ctx := context.Background()
 	command := rest[0]
 	commandArgs := rest[1:]
 
@@ -77,29 +88,43 @@ func run(args []string) int {
 		if len(commandArgs) != 0 {
 			return fail(errors.New("ssh-check does not accept arguments"))
 		}
-		err = sshCheck(client, cfg)
+		connection, connectionErr := provider.Connection(ctx, nil)
+		if connectionErr != nil {
+			err = connectionErr
+			break
+		}
+		err = sshCheck(remote.New(connection), remoteWorkDir)
 	case "connection":
 		if len(commandArgs) != 0 {
 			return fail(errors.New("connection does not accept arguments"))
 		}
-		err = printConnection(client, cfg)
+		connection, connectionErr := provider.Connection(ctx, nil)
+		if connectionErr != nil {
+			err = connectionErr
+			break
+		}
+		err = printConnection(remote.New(connection), connection)
 	case "infra", "incident", "verify":
 		if len(commandArgs) == 0 {
 			return fail(fmt.Errorf("%s requires an exercise name", command))
 		}
-		exercise, dir, loadErr := config.LoadExercise(exerciseRoot, commandArgs[0])
+		item, loadErr := source.Get(ctx, commandArgs[0])
 		if loadErr != nil {
 			return fail(loadErr)
+		}
+		connection, connectionErr := provider.Connection(ctx, vm.RequestFromExercise(item.Exercise))
+		if connectionErr != nil {
+			return fail(connectionErr)
 		}
 		extra := commandArgs[1:]
 		if len(extra) > 0 && extra[0] == "--" {
 			extra = extra[1:]
 		}
-		playbook, selectErr := selectPlaybook(exercise, command)
+		playbook, selectErr := selectPlaybook(item.Exercise, command)
 		if selectErr != nil {
 			return fail(selectErr)
 		}
-		err = runPlaybook(client, cfg, exercise, dir, playbook, extra)
+		err = runPlaybook(remote.New(connection), remoteWorkDir, item.Exercise, item.Dir, playbook, extra)
 	default:
 		usage()
 		return fail(fmt.Errorf("unknown command %q", command))
@@ -114,12 +139,20 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `incidentctl — запуск incident exercises на готовой Linux VM
 
 Usage:
-  incidentctl [-config incidentctl.json] [tui]
-  incidentctl [-config incidentctl.json] ssh-check
-  incidentctl [-config incidentctl.json] connection
-  incidentctl [-config incidentctl.json] infra    <exercise> [-- ansible-playbook args]
-  incidentctl [-config incidentctl.json] incident <exercise> [-- ansible-playbook args]
-  incidentctl [-config incidentctl.json] verify   <exercise> [-- ansible-playbook args]
+  incidentctl [provider flags] [tui]
+  incidentctl [provider flags] ssh-check
+  incidentctl [provider flags] connection
+  incidentctl [provider flags] infra    <exercise> [-- ansible-playbook args]
+  incidentctl [provider flags] incident <exercise> [-- ansible-playbook args]
+  incidentctl [provider flags] verify   <exercise> [-- ansible-playbook args]
+
+Provider flags:
+  -vm-provider direct|microvm-service
+  -config incidentctl.json
+  -microvm-service-config microvm-service.json
+  -exercise-source local|git
+  -exercise-root exersice
+  -exercise-repository-config exercise-repository.json
 
 Exercise definition: exersice/<exercise>/vm.json`)
 }
@@ -129,22 +162,26 @@ func fail(err error) int {
 	return 1
 }
 
-func sshCheck(client *remote.Client, cfg config.Config) error {
-	return client.RunScript(sshCheckScript, cfg.Paths.RemoteWorkDir)
+func sshCheck(client *remote.Client, remoteWorkDir string) error {
+	return client.RunScript(sshCheckScript, remoteWorkDir)
 }
 
-func printConnection(client *remote.Client, cfg config.Config) error {
-	ip, err := client.RunScriptOutput(connectionIPScript)
-	if err != nil {
-		return fmt.Errorf("get target IP: %w", err)
+func printConnection(client *remote.Client, connection vm.Connection) error {
+	ip := connection.IP
+	if ip == "" {
+		var err error
+		ip, err = client.RunScriptOutput(connectionIPScript)
+		if err != nil {
+			return fmt.Errorf("get target IP: %w", err)
+		}
 	}
 	info := connectionInfo{
-		Host:         cfg.Target.Host,
+		Host:         connection.Host,
 		IP:           ip,
-		Port:         cfg.Target.Port,
-		Login:        cfg.Target.User,
-		Password:     nil,
-		IdentityFile: cfg.Target.IdentityFile,
+		Port:         connection.Port,
+		Login:        connection.User,
+		Password:     connection.Password,
+		IdentityFile: connection.IdentityFile,
 	}
 	data, err := json.MarshalIndent(info, "", "  ")
 	if err != nil {
@@ -167,15 +204,15 @@ func selectPlaybook(exercise config.Exercise, command string) (string, error) {
 	}
 }
 
-func runPlaybook(client *remote.Client, cfg config.Config, exercise config.Exercise, dir, playbook string, extra []string) error {
+func runPlaybook(client *remote.Client, remoteWorkDir string, exercise config.Exercise, dir, playbook string, extra []string) error {
 	archive, err := makeArchive(dir)
 	if err != nil {
 		return err
 	}
-	if err := client.RunShellInput(uploadScript, bytes.NewReader(archive), cfg.Paths.RemoteWorkDir, exercise.Name); err != nil {
+	if err := client.RunShellInput(uploadScript, bytes.NewReader(archive), remoteWorkDir, exercise.Name); err != nil {
 		return &playbookRunError{Phase: "upload exercise", Err: err}
 	}
-	args := []string{cfg.Paths.RemoteWorkDir, exercise.Name, playbook}
+	args := []string{remoteWorkDir, exercise.Name, playbook}
 	args = append(args, extra...)
 	if err := client.RunScript(playbookScript, args...); err != nil {
 		return &playbookRunError{Phase: "execute playbook", Err: err}

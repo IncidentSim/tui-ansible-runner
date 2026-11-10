@@ -1,0 +1,4 @@
+[submodule "exersice"]
+	path = exersice
+	url = git@github.com:IncidentSim/exersice.git
+	branch = master

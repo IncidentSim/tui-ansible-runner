@@ -10,22 +10,22 @@ import (
 	"strconv"
 	"strings"
 
-	"incidentctl/internal/config"
+	"incidentctl/internal/vm"
 )
 
 type Client struct {
-	config config.TargetConfig
+	config vm.Connection
 	out    io.Writer
 	errOut io.Writer
 }
 
-func New(cfg config.TargetConfig) *Client {
+func New(cfg vm.Connection) *Client {
 	return &Client{config: cfg, out: os.Stdout, errOut: os.Stderr}
 }
 
 // NewWithWriters creates a client whose remote output can be embedded in a UI
 // or captured by a caller instead of being written directly to the terminal.
-func NewWithWriters(cfg config.TargetConfig, out, errOut io.Writer) *Client {
+func NewWithWriters(cfg vm.Connection, out, errOut io.Writer) *Client {
 	return &Client{config: cfg, out: out, errOut: errOut}
 }
 

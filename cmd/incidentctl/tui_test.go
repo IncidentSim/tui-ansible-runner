@@ -1,18 +1,20 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"incidentctl/internal/config"
+	"incidentctl/internal/exercises"
 	"incidentctl/internal/remote"
+	"incidentctl/internal/vm"
 )
 
 func TestDiscoverExercisesLoadsDescriptionAndTips(t *testing.T) {
 	t.Parallel()
-	items, err := discoverExercises(filepath.Join("..", "..", exerciseRoot))
+	items, err := exercises.NewLocalSource(filepath.Join("..", "..", exerciseRoot)).List(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -20,14 +22,17 @@ func TestDiscoverExercisesLoadsDescriptionAndTips(t *testing.T) {
 		t.Fatal("expected at least one exercise")
 	}
 	item := items[0]
-	if item.err != nil {
-		t.Fatalf("exercise is invalid: %v", item.err)
+	if item.Err != nil {
+		t.Fatalf("exercise is invalid: %v", item.Err)
 	}
-	if item.description == "" || len(item.tips) == 0 {
-		t.Fatalf("description or tips were not loaded: description=%t tips=%d", item.description != "", len(item.tips))
+	if item.Description == "" || len(item.Tips) == 0 {
+		t.Fatalf("description or tips were not loaded: description=%t tips=%d", item.Description != "", len(item.Tips))
 	}
-	if filepath.Base(item.dir) != item.exercise.Name {
-		t.Fatalf("directory %q does not match exercise %q", item.dir, item.exercise.Name)
+	if filepath.Base(item.Dir) != item.Exercise.Name {
+		t.Fatalf("directory %q does not match exercise %q", item.Dir, item.Exercise.Name)
+	}
+	if item.Exercise.Name == "skills" {
+		t.Fatal("skills directory must not be treated as an exercise")
 	}
 }
 
@@ -50,7 +55,7 @@ func TestExpectedVerificationFailureRequiresPlaybookExit(t *testing.T) {
 
 func TestSSHCommandIncludesConnectionSettings(t *testing.T) {
 	t.Parallel()
-	command := sshCommand(config.TargetConfig{
+	command := sshCommand(vm.Connection{
 		Host:                  "vm.example",
 		Port:                  2222,
 		User:                  "root",
@@ -61,13 +66,5 @@ func TestSSHCommandIncludesConnectionSettings(t *testing.T) {
 		if !strings.Contains(command, part) {
 			t.Fatalf("ssh command %q does not contain %q", command, part)
 		}
-	}
-}
-
-func TestMarkdownToTextRemovesHeadingMarkers(t *testing.T) {
-	t.Parallel()
-	got := markdownToText("# Заголовок\n\nТекст\n\n```bash\necho ok\n```\n")
-	if strings.Contains(got, "# Заголовок") || !strings.Contains(got, "Заголовок") || !strings.Contains(got, "echo ok") {
-		t.Fatalf("unexpected markdown conversion: %q", got)
 	}
 }

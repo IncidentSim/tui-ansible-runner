@@ -10,7 +10,8 @@ Firecracker, KVM, TAP-интерфейсы и вложенные гостевы�
 
 - Go 1.26;
 - OpenSSH client;
-- SSH-ключ для целевой VM.
+- SSH-ключ для целевой VM;
+- Git, если выбран удалённый источник заданий.
 
 На VM:
 
@@ -28,6 +29,67 @@ go build -o bin/incidentctl ./cmd/incidentctl
 ```
 
 `incidentctl.json` содержит локальный путь к SSH-ключу и не попадает в Git.
+
+По умолчанию используются существующая VM и локальный каталог заданий:
+
+```bash
+bin/incidentctl \
+  -vm-provider direct \
+  -exercise-source local
+```
+
+Доступны два провайдера подключения к VM:
+
+- `direct` читает SSH-реквизиты из `incidentctl.json` и сохраняет прежнее поведение;
+- `microvm-service` предназначен для удалённого сервиса создания microVM. Сейчас это явная заглушка, возвращающая ошибку `microVM service provider is not implemented`.
+
+Конфигурация будущего сервиса создаётся отдельно:
+
+```bash
+cp microvm-service.example.json microvm-service.json
+bin/incidentctl \
+  -vm-provider microvm-service \
+  -microvm-service-config microvm-service.json
+```
+
+Токен не записывается в JSON: `token_env` содержит имя переменной окружения, из которой реализация сервиса сможет получить токен.
+
+### Источник заданий
+
+Локальный источник читает задания из Git-submodule `exersice/`. После клонирования основного проекта инициализируйте его:
+
+```bash
+git submodule update --init --recursive
+```
+
+Другая директория задаётся через `-exercise-root`.
+
+Удалённый источник работает с обычным Git-репозиторием и не привязан к GitHub API. При запуске он получает указанный `ref` в отдельный каталог кеша, после чего использует тот же файловый загрузчик:
+
+```bash
+cp exercise-repository.example.json exercise-repository.json
+bin/incidentctl \
+  -exercise-source git \
+  -exercise-repository-config exercise-repository.json
+```
+
+Шаблон уже настроен на `git@github.com:IncidentSim/exersice.git`, ветку `master` и корень репозитория. Формат репозитория описан в `exersice/README.md`.
+
+Чтобы отредактировать и опубликовать задания из этого checkout:
+
+```bash
+cd exersice
+git switch master
+git pull --ff-only
+# изменить задания, skills или README
+git add .
+git commit -m "Describe exercise update"
+git push origin master
+cd ..
+git add exersice
+```
+
+Последняя команда обновляет gitlink основного проекта на новый commit подмодуля.
 
 ### Подготовка Ubuntu VM
 
@@ -94,6 +156,17 @@ bin/incidentctl incident nginx-wrong-api
 
 # Проверить пользовательский сценарий; ненулевой код означает провал проверки
 bin/incidentctl verify nginx-wrong-api
+```
+
+Все команды принимают одинаковые флаги выбора провайдеров:
+
+```text
+-vm-provider direct|microvm-service
+-config incidentctl.json
+-microvm-service-config microvm-service.json
+-exercise-source local|git
+-exercise-root exersice
+-exercise-repository-config exercise-repository.json
 ```
 
 ## Интерактивный режим

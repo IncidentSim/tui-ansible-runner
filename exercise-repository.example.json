@@ -1,0 +1,6 @@
+{
+  "repository": "git@github.com:IncidentSim/exersice.git",
+  "ref": "master",
+  "subdirectory": ".",
+  "cache_dir": "~/.cache/incidentctl/exercises"
+}

@@ -2,13 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -16,7 +15,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"incidentctl/internal/config"
+	"incidentctl/internal/exercises"
 	"incidentctl/internal/remote"
+	"incidentctl/internal/vm"
 )
 
 const incidentSimLogo = `  ___           _     _            _   ____  _
@@ -57,26 +58,29 @@ type exerciseItem struct {
 }
 
 type operationResult struct {
-	kind   operation
-	output string
-	err    error
+	kind       operation
+	output     string
+	connection *vm.Connection
+	err        error
 }
 
 type tuiModel struct {
-	config     *config.Config
-	configErr  error
-	exercises  []exerciseItem
-	screen     tuiScreen
-	returnTo   tuiScreen
-	tipsReturn tuiScreen
-	selected   int
-	tipIndex   int
-	scroll     int
-	width      int
-	height     int
-	busy       bool
-	status     string
-	logs       string
+	provider      vm.ConnectionProvider
+	providerErr   error
+	remoteWorkDir string
+	connection    *vm.Connection
+	exercises     []exerciseItem
+	screen        tuiScreen
+	returnTo      tuiScreen
+	tipsReturn    tuiScreen
+	selected      int
+	tipIndex      int
+	scroll        int
+	width         int
+	height        int
+	busy          bool
+	status        string
+	logs          string
 }
 
 var (
@@ -89,98 +93,35 @@ var (
 	panelStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#465166")).Padding(0, 1)
 )
 
-func runTUI(configPath string) error {
-	exercises, err := discoverExercises(exerciseRoot)
+func runTUI(source exercises.Source, provider vm.ConnectionProvider, remoteWorkDir string, providerErr error) error {
+	loaded, err := source.List(context.Background())
 	if err != nil {
 		return err
 	}
-	model := tuiModel{exercises: exercises, screen: screenExercises, returnTo: screenExercises}
-	if cfg, loadErr := config.Load(configPath); loadErr != nil {
-		model.configErr = loadErr
-	} else {
-		model.config = &cfg
+	items := make([]exerciseItem, 0, len(loaded))
+	for _, item := range loaded {
+		tips := make([]tip, 0, len(item.Tips))
+		for _, loadedTip := range item.Tips {
+			tips = append(tips, tip{title: loadedTip.Title, body: loadedTip.Body})
+		}
+		items = append(items, exerciseItem{
+			exercise:    item.Exercise,
+			dir:         item.Dir,
+			description: item.Description,
+			tips:        tips,
+			err:         item.Err,
+		})
+	}
+	model := tuiModel{
+		provider:      provider,
+		providerErr:   providerErr,
+		remoteWorkDir: remoteWorkDir,
+		exercises:     items,
+		screen:        screenExercises,
+		returnTo:      screenExercises,
 	}
 	_, err = tea.NewProgram(model, tea.WithAltScreen()).Run()
 	return err
-}
-
-func discoverExercises(root string) ([]exerciseItem, error) {
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return nil, fmt.Errorf("read exercises: %w", err)
-	}
-	items := make([]exerciseItem, 0, len(entries))
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		item := exerciseItem{dir: filepath.Join(root, entry.Name())}
-		item.exercise, item.dir, item.err = config.LoadExercise(root, entry.Name())
-		if data, readErr := os.ReadFile(filepath.Join(item.dir, "README.md")); readErr == nil {
-			item.description = markdownToText(string(data))
-		} else if item.err == nil {
-			item.err = fmt.Errorf("read README.md: %w", readErr)
-		}
-		item.tips, err = loadTips(item.dir)
-		if err != nil && item.err == nil {
-			item.err = err
-		}
-		items = append(items, item)
-	}
-	sort.Slice(items, func(i, j int) bool { return items[i].exercise.Name < items[j].exercise.Name })
-	return items, nil
-}
-
-func loadTips(dir string) ([]tip, error) {
-	paths, err := filepath.Glob(filepath.Join(dir, "tips", "*.md"))
-	if err != nil {
-		return nil, fmt.Errorf("list tips: %w", err)
-	}
-	sort.Strings(paths)
-	tips := make([]tip, 0, len(paths))
-	for _, path := range paths {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", path, err)
-		}
-		body := markdownToText(string(data))
-		title := firstLine(body)
-		if title == "" {
-			title = filepath.Base(path)
-		}
-		tips = append(tips, tip{title: title, body: body})
-	}
-	return tips, nil
-}
-
-func markdownToText(value string) string {
-	lines := strings.Split(strings.ReplaceAll(value, "\r\n", "\n"), "\n")
-	inFence := false
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "```") {
-			inFence = !inFence
-			lines[i] = ""
-			continue
-		}
-		if !inFence {
-			line = strings.TrimLeft(line, " \t")
-			if strings.HasPrefix(line, "#") {
-				line = strings.TrimSpace(strings.TrimLeft(line, "#"))
-			}
-		}
-		lines[i] = line
-	}
-	return strings.TrimSpace(strings.Join(lines, "\n"))
-}
-
-func firstLine(value string) string {
-	for _, line := range strings.Split(value, "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			return line
-		}
-	}
-	return ""
 }
 
 func withoutFirstLine(value string) string {
@@ -203,6 +144,9 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case operationResult:
 		m.busy = false
 		m.logs = msg.output
+		if msg.connection != nil {
+			m.connection = msg.connection
+		}
 		if msg.err != nil {
 			m.status = "Ошибка: " + msg.err.Error()
 			return m, nil
@@ -287,17 +231,17 @@ func (m tuiModel) updateKey(key string) (tea.Model, tea.Cmd) {
 		case "t":
 			m.screen, m.tipsReturn, m.tipIndex = screenTips, screenSolution, 0
 		case "c":
-			if m.config != nil {
-				m.status = sshCommand(m.config.Target)
+			if m.connection != nil {
+				m.status = sshCommand(*m.connection)
 			} else {
-				m.status = "SSH недоступен: " + m.configErr.Error()
+				m.status = "SSH недоступен: подключение к VM ещё не получено"
 			}
 		case "o":
 			return m.openSSH()
 		case "v":
 			return m.verifySolution()
 		case "x", "esc":
-			m.screen, m.status, m.logs = screenExercises, "", ""
+			m.screen, m.status, m.logs, m.connection = screenExercises, "", "", nil
 		}
 	}
 	return m, nil
@@ -317,15 +261,23 @@ func (m tuiModel) startSolution() (tea.Model, tea.Cmd) {
 		m.status = "Упражнение недоступно: " + item.err.Error()
 		return m, nil
 	}
-	if m.config == nil {
-		m.status = "Нельзя начать: " + m.configErr.Error()
+	if m.providerErr != nil {
+		m.status = "Нельзя начать: " + m.providerErr.Error()
+		return m, nil
+	}
+	if m.provider == nil {
+		m.status = "Нельзя начать: провайдер VM не настроен"
 		return m, nil
 	}
 	m.screen, m.busy, m.status, m.logs = screenSolution, true, "Подготавливаю инфраструктуру…", ""
-	cfg := *m.config
+	provider, remoteWorkDir := m.provider, m.remoteWorkDir
 	return m, func() tea.Msg {
 		var output bytes.Buffer
-		client := remote.NewWithWriters(cfg.Target, &output, &output)
+		connection, err := provider.Connection(context.Background(), vm.RequestFromExercise(item.exercise))
+		if err != nil {
+			return operationResult{kind: operationStart, output: output.String(), err: err}
+		}
+		client := remote.NewWithWriters(connection, &output, &output)
 		steps := []struct {
 			name     string
 			playbook string
@@ -335,20 +287,20 @@ func (m tuiModel) startSolution() (tea.Model, tea.Cmd) {
 		}
 		for _, step := range steps {
 			fmt.Fprintf(&output, "\n━━ %s ━━\n", step.name)
-			if err := runPlaybook(client, cfg, item.exercise, item.dir, step.playbook, nil); err != nil {
-				return operationResult{kind: operationStart, output: output.String(), err: err}
+			if err := runPlaybook(client, remoteWorkDir, item.exercise, item.dir, step.playbook, nil); err != nil {
+				return operationResult{kind: operationStart, output: output.String(), connection: &connection, err: err}
 			}
 		}
 		fmt.Fprintln(&output, "\n━━ Проверка ожидаемого провала ━━")
-		err := runPlaybook(client, cfg, item.exercise, item.dir, item.exercise.Playbooks.Verification, nil)
+		err = runPlaybook(client, remoteWorkDir, item.exercise, item.dir, item.exercise.Playbooks.Verification, nil)
 		if err == nil {
-			return operationResult{kind: operationStart, output: output.String(), err: errors.New("verification неожиданно прошла после внесения инцидента")}
+			return operationResult{kind: operationStart, output: output.String(), connection: &connection, err: errors.New("verification неожиданно прошла после внесения инцидента")}
 		}
 		if !isExpectedVerificationFailure(err) {
-			return operationResult{kind: operationStart, output: output.String(), err: fmt.Errorf("не удалось подтвердить ожидаемый провал verification: %w", err)}
+			return operationResult{kind: operationStart, output: output.String(), connection: &connection, err: fmt.Errorf("не удалось подтвердить ожидаемый провал verification: %w", err)}
 		}
 		fmt.Fprintln(&output, "verification завершилась с ненулевым кодом — ожидаемый результат.")
-		return operationResult{kind: operationStart, output: output.String()}
+		return operationResult{kind: operationStart, output: output.String(), connection: &connection}
 	}
 }
 
@@ -362,26 +314,26 @@ func isExpectedVerificationFailure(err error) bool {
 }
 
 func (m tuiModel) verifySolution() (tea.Model, tea.Cmd) {
-	if m.config == nil {
-		m.status = "Проверка недоступна: " + m.configErr.Error()
+	if m.connection == nil {
+		m.status = "Проверка недоступна: подключение к VM ещё не получено"
 		return m, nil
 	}
-	item, cfg := m.current(), *m.config
+	item, connection, remoteWorkDir := m.current(), *m.connection, m.remoteWorkDir
 	m.busy, m.status = true, "Проверяю решение…"
 	return m, func() tea.Msg {
 		var output bytes.Buffer
-		client := remote.NewWithWriters(cfg.Target, &output, &output)
-		err := runPlaybook(client, cfg, item.exercise, item.dir, item.exercise.Playbooks.Verification, nil)
+		client := remote.NewWithWriters(connection, &output, &output)
+		err := runPlaybook(client, remoteWorkDir, item.exercise, item.dir, item.exercise.Playbooks.Verification, nil)
 		return operationResult{kind: operationVerify, output: output.String(), err: err}
 	}
 }
 
 func (m tuiModel) openSSH() (tea.Model, tea.Cmd) {
-	if m.config == nil {
-		m.status = "SSH недоступен: " + m.configErr.Error()
+	if m.connection == nil {
+		m.status = "SSH недоступен: подключение к VM ещё не получено"
 		return m, nil
 	}
-	target := m.config.Target
+	target := *m.connection
 	m.busy, m.status = true, "Открываю отдельное окно терминала…"
 	return m, func() tea.Msg {
 		err := openSSHTerminal(target)
@@ -389,7 +341,7 @@ func (m tuiModel) openSSH() (tea.Model, tea.Cmd) {
 	}
 }
 
-func sshCommand(target config.TargetConfig) string {
+func sshCommand(target vm.Connection) string {
 	args := []string{"ssh", "-p", strconv.Itoa(target.Port), "-o", "BatchMode=yes"}
 	if target.IdentityFile != "" {
 		args = append(args, "-i", target.IdentityFile)
@@ -412,7 +364,7 @@ func localShellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
 }
 
-func openSSHTerminal(target config.TargetConfig) error {
+func openSSHTerminal(target vm.Connection) error {
 	command := sshCommand(target)
 	switch runtime.GOOS {
 	case "darwin":

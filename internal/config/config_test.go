@@ -51,6 +51,37 @@ func TestExerciseValidateRejectsDuplicatePackages(t *testing.T) {
 	}
 }
 
+func TestMicroVMServiceConfigValidate(t *testing.T) {
+	t.Parallel()
+	valid := MicroVMServiceConfig{
+		BaseURL:        "https://microvm.example/api",
+		TokenEnv:       "INCIDENTCTL_MICROVM_TOKEN",
+		TimeoutSeconds: 30,
+		RemoteWorkDir:  "/var/tmp/incidentctl/exercises",
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid config was rejected: %v", err)
+	}
+	invalid := valid
+	invalid.BaseURL = "microvm.example"
+	if err := invalid.Validate(); err == nil {
+		t.Fatal("relative service URL must be rejected")
+	}
+}
+
+func TestExerciseRepositoryConfigRejectsTraversal(t *testing.T) {
+	t.Parallel()
+	cfg := ExerciseRepositoryConfig{
+		Repository:   "git@example.invalid:incidents.git",
+		Ref:          "main",
+		Subdirectory: "../private",
+		CacheDir:     filepath.Join(t.TempDir(), "cache"),
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("repository subdirectory traversal must be rejected")
+	}
+}
+
 func validConfig(t *testing.T) Config {
 	t.Helper()
 	key := filepath.Join(t.TempDir(), "id_ed25519")

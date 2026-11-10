@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,6 +13,7 @@ import (
 )
 
 var safeName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$`)
+var safeEnvironmentName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 type Config struct {
 	Target TargetConfig `json:"target"`
@@ -28,6 +30,20 @@ type TargetConfig struct {
 
 type PathsConfig struct {
 	RemoteWorkDir string `json:"remote_work_dir"`
+}
+
+type MicroVMServiceConfig struct {
+	BaseURL        string `json:"base_url"`
+	TokenEnv       string `json:"token_env"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+	RemoteWorkDir  string `json:"remote_work_dir"`
+}
+
+type ExerciseRepositoryConfig struct {
+	Repository   string `json:"repository"`
+	Ref          string `json:"ref"`
+	Subdirectory string `json:"subdirectory"`
+	CacheDir     string `json:"cache_dir"`
 }
 
 type Exercise struct {
@@ -81,6 +97,39 @@ func Load(path string) (Config, error) {
 		return cfg, err
 	}
 	cfg.Target.IdentityFile = identityFile
+	return cfg, cfg.Validate()
+}
+
+func LoadMicroVMService(path string) (MicroVMServiceConfig, error) {
+	var cfg MicroVMServiceConfig
+	if err := decode(path, &cfg); err != nil {
+		return cfg, err
+	}
+	if cfg.TimeoutSeconds == 0 {
+		cfg.TimeoutSeconds = 30
+	}
+	if cfg.RemoteWorkDir == "" {
+		cfg.RemoteWorkDir = "/var/tmp/incidentctl/exercises"
+	}
+	return cfg, cfg.Validate()
+}
+
+func LoadExerciseRepository(path string) (ExerciseRepositoryConfig, error) {
+	var cfg ExerciseRepositoryConfig
+	if err := decode(path, &cfg); err != nil {
+		return cfg, err
+	}
+	if cfg.Ref == "" {
+		cfg.Ref = "main"
+	}
+	if cfg.Subdirectory == "" {
+		cfg.Subdirectory = "exersice"
+	}
+	cacheDir, err := expandHome(cfg.CacheDir)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.CacheDir = cacheDir
 	return cfg, cfg.Validate()
 }
 
@@ -138,6 +187,40 @@ func (c Config) Validate() error {
 	}
 	if !safeAbsolutePath(c.Paths.RemoteWorkDir) {
 		return errors.New("paths.remote_work_dir must be an absolute path other than /")
+	}
+	return nil
+}
+
+func (c MicroVMServiceConfig) Validate() error {
+	parsedURL, err := url.ParseRequestURI(c.BaseURL)
+	if err != nil || parsedURL.Host == "" || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+		return errors.New("base_url must be an absolute HTTP or HTTPS URL")
+	}
+	if c.TokenEnv != "" && !safeEnvironmentName.MatchString(c.TokenEnv) {
+		return errors.New("token_env must be a valid environment variable name")
+	}
+	if c.TimeoutSeconds < 1 {
+		return errors.New("timeout_seconds must be positive")
+	}
+	if !safeAbsolutePath(c.RemoteWorkDir) {
+		return errors.New("remote_work_dir must be an absolute path other than /")
+	}
+	return nil
+}
+
+func (c ExerciseRepositoryConfig) Validate() error {
+	if strings.TrimSpace(c.Repository) == "" || strings.ContainsAny(c.Repository, "\r\n") {
+		return errors.New("repository is required and must not contain line breaks")
+	}
+	if strings.TrimSpace(c.Ref) == "" || strings.ContainsAny(c.Ref, "\r\n") {
+		return errors.New("ref is required and must not contain line breaks")
+	}
+	cleanSubdirectory := filepath.Clean(c.Subdirectory)
+	if filepath.IsAbs(cleanSubdirectory) || cleanSubdirectory == ".." || strings.HasPrefix(filepath.ToSlash(cleanSubdirectory), "../") {
+		return errors.New("subdirectory must be a relative path inside the repository")
+	}
+	if !safeAbsolutePath(c.CacheDir) {
+		return errors.New("cache_dir must be an absolute path other than /")
 	}
 	return nil
 }
