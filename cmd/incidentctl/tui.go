@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -81,6 +82,23 @@ const (
 	solutionOpenTerminal
 )
 
+const solutionStageCount = int(solutionOpenTerminal) + 1
+
+var solutionStageNames = [...]string{
+	"Проверка токена",
+	"Создание виртуальной машины",
+	"Подключение к SSH",
+	"Подготовка Ansible",
+	"Применение infra",
+	"Применение incident",
+	"Проверка инцидента",
+	"Открытие веб-терминала",
+}
+
+var spinnerFrames = [...]string{"◐", "◓", "◑", "◒"}
+
+type spinnerTickMsg struct{}
+
 type solutionRun struct {
 	provider      vm.APIProvider
 	item          exerciseItem
@@ -105,29 +123,36 @@ const (
 )
 
 type tuiModel struct {
-	provider         vm.ConnectionProvider
-	remoteWorkDir    string
-	connection       *vm.Connection
-	sshCleanup       func()
-	solution         *solutionRun
-	exercises        []exerciseItem
-	screen           tuiScreen
-	returnTo         tuiScreen
-	tipsReturn       tuiScreen
-	selected         int
-	tipIndex         int
-	scroll           int
-	width            int
-	height           int
-	busy             bool
-	status           string
-	logs             string
-	tokenFile        string
-	token            string
-	tokenInput       string
-	tokenInstalledAt int64
-	tokenReturn      tuiScreen
-	tokenError       string
+	provider          vm.ConnectionProvider
+	remoteWorkDir     string
+	connection        *vm.Connection
+	sshCleanup        func()
+	solution          *solutionRun
+	exercises         []exerciseItem
+	screen            tuiScreen
+	returnTo          tuiScreen
+	tipsReturn        tuiScreen
+	selected          int
+	tipIndex          int
+	scroll            int
+	width             int
+	height            int
+	busy              bool
+	status            string
+	logs              string
+	spinnerFrame      int
+	solutionStage     solutionStage
+	solutionStarted   time.Time
+	solutionDurations [solutionStageCount]time.Duration
+	solutionDone      [solutionStageCount]bool
+	solutionFailed    bool
+	solutionFailure   solutionStage
+	tokenFile         string
+	token             string
+	tokenInput        string
+	tokenInstalledAt  int64
+	tokenReturn       tuiScreen
+	tokenError        string
 }
 
 var (
@@ -204,11 +229,20 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		return m, nil
+	case spinnerTickMsg:
+		if !m.busy || m.screen != screenSolution {
+			return m, nil
+		}
+		m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
+		return m, spinnerTickCmd()
 	case solutionStageResult:
 		if msg.run != m.solution {
 			return m, nil
 		}
 		if msg.err != nil {
+			m.completeSolutionStage(msg.stage)
+			m.solutionFailed = true
+			m.solutionFailure = msg.stage
 			m.busy = false
 			m.adoptSolutionConnection(msg.run)
 			if errors.Is(msg.err, vm.ErrTokenExpired) {
@@ -221,27 +255,28 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.logs = msg.run.output.String()
 			return m, nil
 		}
+		m.completeSolutionStage(msg.stage)
 		switch msg.stage {
 		case solutionCheckCapabilities:
-			m.status = "Создаю виртуальную машину…"
+			m.startSolutionStage(solutionCreateVM, "Создаю виртуальную машину…")
 			return m, msg.run.createVMCmd()
 		case solutionCreateVM:
-			m.status = "Ожидаю готовность SSH…"
+			m.startSolutionStage(solutionConnectSSH, "Ожидаю готовность SSH…")
 			return m, msg.run.connectSSHCmd()
 		case solutionConnectSSH:
-			m.status = "Устанавливаю всё необходимое для Ansible…"
+			m.startSolutionStage(solutionPrepareAnsible, "Устанавливаю всё необходимое для Ansible…")
 			return m, msg.run.prepareAnsibleCmd()
 		case solutionPrepareAnsible:
-			m.status = "Применяю инфраструктурный playbook…"
+			m.startSolutionStage(solutionApplyInfra, "Применяю инфраструктурный playbook…")
 			return m, msg.run.applyInfraCmd()
 		case solutionApplyInfra:
-			m.status = "Применяю incident playbook…"
+			m.startSolutionStage(solutionApplyIncident, "Применяю incident playbook…")
 			return m, msg.run.applyIncidentCmd()
 		case solutionApplyIncident:
-			m.status = "Проверяю, что инцидент воспроизведён…"
+			m.startSolutionStage(solutionVerifyIncident, "Проверяю, что инцидент воспроизведён…")
 			return m, msg.run.verifyIncidentCmd()
 		case solutionVerifyIncident:
-			m.status = "Инфраструктура подготовлена. Открываю веб-терминал…"
+			m.startSolutionStage(solutionOpenTerminal, "Инфраструктура подтверждена. Открываю веб-терминал…")
 			return m, msg.run.openTerminalCmd()
 		case solutionOpenTerminal:
 			m.busy = false
@@ -456,8 +491,31 @@ func (m tuiModel) startSolution() (tea.Model, tea.Cmd) {
 		remoteWorkDir: m.remoteWorkDir,
 	}
 	m.solution = run
-	m.screen, m.busy, m.status, m.logs = screenSolution, true, "Проверяю токен…", ""
-	return m, run.checkCapabilitiesCmd()
+	m.solutionDurations = [solutionStageCount]time.Duration{}
+	m.solutionDone = [solutionStageCount]bool{}
+	m.solutionFailed = false
+	m.screen, m.busy, m.logs = screenSolution, true, ""
+	m.startSolutionStage(solutionCheckCapabilities, "Проверяю токен…")
+	return m, tea.Batch(run.checkCapabilitiesCmd(), spinnerTickCmd())
+}
+
+func spinnerTickCmd() tea.Cmd {
+	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return spinnerTickMsg{} })
+}
+
+func (m *tuiModel) startSolutionStage(stage solutionStage, status string) {
+	m.solutionStage = stage
+	m.solutionStarted = time.Now()
+	m.spinnerFrame = 0
+	m.status = status
+}
+
+func (m *tuiModel) completeSolutionStage(stage solutionStage) {
+	if stage < 0 || int(stage) >= solutionStageCount || m.solutionStarted.IsZero() {
+		return
+	}
+	m.solutionDurations[stage] = time.Since(m.solutionStarted)
+	m.solutionDone[stage] = true
 }
 
 func (r *solutionRun) checkCapabilitiesCmd() tea.Cmd {
@@ -782,7 +840,7 @@ func (m tuiModel) viewSolution(width int) string {
 	item := m.current()
 	state := m.status
 	if m.busy {
-		state = "◌ " + state
+		state = spinnerFrames[m.spinnerFrame] + " " + state
 	} else if strings.HasPrefix(state, "Ошибка") {
 		state = errorStyle.Render(state)
 	} else if state != "" {
@@ -791,15 +849,51 @@ func (m tuiModel) viewSolution(width int) string {
 	if state == "" {
 		state = mutedStyle.Render("Решение активно.")
 	}
-	logHeight := max(5, min(14, m.height-18))
+	logHeight := max(4, min(10, m.height-27))
 	logs := tailLines(m.logs, logHeight)
 	if logs == "" {
 		logs = mutedStyle.Render("Вывод команд появится здесь.")
 	}
 	content := titleStyle.Render("Решение · "+item.exercise.Name) + "\n\n" + state + "\n\n"
+	content += m.viewSolutionStages() + "\n"
 	content += mutedStyle.Render("Последний вывод") + "\n" + logs + "\n\n"
 	content += mutedStyle.Render("d описание   t подсказки   a токен   x выйти из решения   q выйти")
 	return panelStyle.Width(max(30, width-4)).Render(content)
+}
+
+func (m tuiModel) viewSolutionStages() string {
+	var b strings.Builder
+	b.WriteString(mutedStyle.Render("Этапы") + "\n")
+	for index, name := range solutionStageNames {
+		stage := solutionStage(index)
+		symbol := "·"
+		lineStyle := mutedStyle
+		duration := "—"
+		if m.solutionFailed && m.solutionFailure == stage {
+			duration = formatStageDuration(m.solutionDurations[index])
+			symbol = "✗"
+			lineStyle = errorStyle
+		} else if m.solutionDone[index] {
+			duration = formatStageDuration(m.solutionDurations[index])
+			symbol = "✓"
+			lineStyle = successStyle
+		} else if m.busy && m.solutionStage == stage {
+			symbol = spinnerFrames[m.spinnerFrame]
+			duration = formatStageDuration(time.Since(m.solutionStarted))
+			lineStyle = titleStyle
+		}
+		b.WriteString(lineStyle.Render(fmt.Sprintf("%s %-34s %s", symbol, name, duration)) + "\n")
+	}
+	return b.String()
+}
+
+func formatStageDuration(duration time.Duration) string {
+	if duration < time.Second {
+		return fmt.Sprintf("%.1fs", duration.Seconds())
+	}
+	minutes := int(duration / time.Minute)
+	seconds := int(duration/time.Second) % 60
+	return fmt.Sprintf("%02d:%02d", minutes, seconds)
 }
 
 func (m tuiModel) viewToken(width int) string {
