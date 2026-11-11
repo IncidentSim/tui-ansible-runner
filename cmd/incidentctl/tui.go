@@ -16,6 +16,7 @@ import (
 
 	"incidentctl/internal/config"
 	"incidentctl/internal/exercises"
+	"incidentctl/internal/identity"
 	"incidentctl/internal/remote"
 	"incidentctl/internal/vm"
 )
@@ -34,6 +35,7 @@ const (
 	screenTips
 	screenTip
 	screenSolution
+	screenToken
 )
 
 type operation int
@@ -61,26 +63,37 @@ type operationResult struct {
 	kind       operation
 	output     string
 	connection *vm.Connection
+	status     string
 	err        error
 }
 
+const (
+	tokenExpiredMessage = "токен просрочен, обновите токен перед решением задач"
+	serverBusyMessage   = "сейчас сервер занят, попробуйте подключиться позже"
+)
+
 type tuiModel struct {
-	provider      vm.ConnectionProvider
-	providerErr   error
-	remoteWorkDir string
-	connection    *vm.Connection
-	exercises     []exerciseItem
-	screen        tuiScreen
-	returnTo      tuiScreen
-	tipsReturn    tuiScreen
-	selected      int
-	tipIndex      int
-	scroll        int
-	width         int
-	height        int
-	busy          bool
-	status        string
-	logs          string
+	provider         vm.ConnectionProvider
+	remoteWorkDir    string
+	connection       *vm.Connection
+	exercises        []exerciseItem
+	screen           tuiScreen
+	returnTo         tuiScreen
+	tipsReturn       tuiScreen
+	selected         int
+	tipIndex         int
+	scroll           int
+	width            int
+	height           int
+	busy             bool
+	status           string
+	logs             string
+	tokenFile        string
+	token            string
+	tokenInput       string
+	tokenInstalledAt int64
+	tokenReturn      tuiScreen
+	tokenError       string
 }
 
 var (
@@ -93,7 +106,7 @@ var (
 	panelStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#465166")).Padding(0, 1)
 )
 
-func runTUI(source exercises.Source, provider vm.ConnectionProvider, remoteWorkDir string, providerErr error) error {
+func runTUI(source exercises.Source, provider vm.ConnectionProvider, remoteWorkDir, tokenFile string) error {
 	loaded, err := source.List(context.Background())
 	if err != nil {
 		return err
@@ -114,11 +127,27 @@ func runTUI(source exercises.Source, provider vm.ConnectionProvider, remoteWorkD
 	}
 	model := tuiModel{
 		provider:      provider,
-		providerErr:   providerErr,
 		remoteWorkDir: remoteWorkDir,
 		exercises:     items,
 		screen:        screenExercises,
 		returnTo:      screenExercises,
+		tokenFile:     tokenFile,
+	}
+	if tokenRecord, tokenErr := identity.LoadToken(tokenFile); tokenErr == nil {
+		model.token = tokenRecord.Token
+		model.tokenInstalledAt = tokenRecord.InstalledAt
+	}
+	if apiProvider, ok := provider.(vm.APIProvider); ok {
+		_, capabilityErr := apiProvider.Capabilities(context.Background())
+		switch {
+		case capabilityErr == nil:
+		case errors.Is(capabilityErr, vm.ErrTokenRequired):
+			model.status = "Токен не установлен. Укажите токен перед решением задачи."
+		case errors.Is(capabilityErr, vm.ErrTokenExpired):
+			model.status = tokenExpiredMessage
+		default:
+			model.status = "Сервис виртуальных машин недоступен. Попробуйте подключиться позже."
+		}
 	}
 	_, err = tea.NewProgram(model, tea.WithAltScreen()).Run()
 	return err
@@ -151,9 +180,17 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "Ошибка: " + msg.err.Error()
 			return m, nil
 		}
+		if msg.status != "" {
+			m.status = msg.status
+			return m, nil
+		}
 		switch msg.kind {
 		case operationStart:
-			m.status = "Задача готова: инфраструктура создана, инцидент внесён, проверка ожидаемо падает."
+			if msg.output != "" {
+				m.status = "Виртуальная машина готова, веб-терминал открыт."
+			} else {
+				m.status = "Задача готова: инфраструктура создана, инцидент внесён, проверка ожидаемо падает."
+			}
 		case operationVerify:
 			m.status = "Проверка решения прошла успешно."
 		case operationOpenSSH:
@@ -166,6 +203,9 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.busy {
 			return m, nil
+		}
+		if m.screen == screenToken {
+			return m.updateTokenKey(msg)
 		}
 		return m.updateKey(msg.String())
 	}
@@ -186,6 +226,8 @@ func (m tuiModel) updateKey(key string) (tea.Model, tea.Cmd) {
 			if len(m.exercises) > 0 {
 				m.screen, m.returnTo, m.scroll = screenDescription, screenExercises, 0
 			}
+		case "a":
+			return m.startTokenInput(screenExercises)
 		}
 	case screenDescription:
 		switch key {
@@ -199,6 +241,8 @@ func (m tuiModel) updateKey(key string) (tea.Model, tea.Cmd) {
 			m.screen, m.tipsReturn, m.tipIndex, m.scroll = screenTips, screenDescription, 0, 0
 		case "s":
 			return m.startSolution()
+		case "a":
+			return m.startTokenInput(screenDescription)
 		}
 	case screenTips:
 		switch key {
@@ -240,10 +284,58 @@ func (m tuiModel) updateKey(key string) (tea.Model, tea.Cmd) {
 			return m.openSSH()
 		case "v":
 			return m.verifySolution()
+		case "a":
+			return m.startTokenInput(screenSolution)
 		case "x", "esc":
 			m.screen, m.status, m.logs, m.connection = screenExercises, "", "", nil
 		}
 	}
+	return m, nil
+}
+
+func (m tuiModel) startTokenInput(returnTo tuiScreen) (tea.Model, tea.Cmd) {
+	m.screen = screenToken
+	m.tokenReturn = returnTo
+	m.tokenInput = ""
+	m.tokenError = ""
+	return m, nil
+}
+
+func (m tuiModel) updateTokenKey(message tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch message.String() {
+	case "esc":
+		m.screen = m.tokenReturn
+		m.tokenError = ""
+	case "backspace", "ctrl+h":
+		runes := []rune(m.tokenInput)
+		if len(runes) > 0 {
+			m.tokenInput = string(runes[:len(runes)-1])
+		}
+	case "enter":
+		return m.saveToken()
+	default:
+		if message.Type == tea.KeyRunes {
+			m.tokenInput += string(message.Runes)
+		}
+	}
+	return m, nil
+}
+
+func (m tuiModel) saveToken() (tea.Model, tea.Cmd) {
+	record, err := identity.SaveToken(m.tokenFile, m.tokenInput)
+	if err != nil {
+		m.tokenError = "Не удалось сохранить токен: " + err.Error()
+		return m, nil
+	}
+	if tokenProvider, ok := m.provider.(interface{ SetToken(string) }); ok {
+		tokenProvider.SetToken(record.Token)
+	}
+	m.token = record.Token
+	m.tokenInstalledAt = record.InstalledAt
+	m.tokenInput = ""
+	m.tokenError = ""
+	m.status = "Токен сохранён."
+	m.screen = m.tokenReturn
 	return m, nil
 }
 
@@ -261,46 +353,49 @@ func (m tuiModel) startSolution() (tea.Model, tea.Cmd) {
 		m.status = "Упражнение недоступно: " + item.err.Error()
 		return m, nil
 	}
-	if m.providerErr != nil {
-		m.status = "Нельзя начать: " + m.providerErr.Error()
-		return m, nil
-	}
 	if m.provider == nil {
 		m.status = "Нельзя начать: провайдер VM не настроен"
 		return m, nil
 	}
-	m.screen, m.busy, m.status, m.logs = screenSolution, true, "Подготавливаю инфраструктуру…", ""
-	provider, remoteWorkDir := m.provider, m.remoteWorkDir
+	if m.token == "" {
+		return m.startTokenInput(screenDescription)
+	}
+	apiProvider, ok := m.provider.(vm.APIProvider)
+	if !ok {
+		m.status = "Провайдер VM не поддерживает API создания виртуальной машины"
+		return m, nil
+	}
+	m.screen, m.busy, m.status, m.logs = screenSolution, true, "Проверяю токен и создаю виртуальную машину…", ""
 	return m, func() tea.Msg {
-		var output bytes.Buffer
-		connection, err := provider.Connection(context.Background(), vm.RequestFromExercise(item.exercise))
+		ctx := context.Background()
+		if _, err := apiProvider.Capabilities(ctx); err != nil {
+			if errors.Is(err, vm.ErrTokenExpired) {
+				return operationResult{kind: operationStart, status: tokenExpiredMessage}
+			}
+			return operationResult{kind: operationStart, status: serverBusyMessage}
+		}
+		instance, err := apiProvider.CreateVM(ctx, vm.RequestFromExercise(item.exercise))
 		if err != nil {
-			return operationResult{kind: operationStart, output: output.String(), err: err}
+			if errors.Is(err, vm.ErrTokenExpired) {
+				return operationResult{kind: operationStart, status: tokenExpiredMessage}
+			}
+			return operationResult{kind: operationStart, status: serverBusyMessage}
 		}
-		client := remote.NewWithWriters(connection, &output, &output)
-		steps := []struct {
-			name     string
-			playbook string
-		}{
-			{"Создание инфраструктуры", item.exercise.Playbooks.Infra},
-			{"Внесение инцидента", item.exercise.Playbooks.Incident},
+		terminalURL, err := apiProvider.TerminalURL(ctx, instance.ID)
+		if err != nil {
+			if errors.Is(err, vm.ErrTokenExpired) {
+				return operationResult{kind: operationStart, status: tokenExpiredMessage}
+			}
+			return operationResult{kind: operationStart, status: serverBusyMessage}
 		}
-		for _, step := range steps {
-			fmt.Fprintf(&output, "\n━━ %s ━━\n", step.name)
-			if err := runPlaybook(client, remoteWorkDir, item.exercise, item.dir, step.playbook, nil); err != nil {
-				return operationResult{kind: operationStart, output: output.String(), connection: &connection, err: err}
+		if err := openBrowserURL(terminalURL); err != nil {
+			return operationResult{
+				kind:   operationStart,
+				output: "Веб-терминал: " + terminalURL,
+				err:    fmt.Errorf("не удалось открыть веб-терминал: %w", err),
 			}
 		}
-		fmt.Fprintln(&output, "\n━━ Проверка ожидаемого провала ━━")
-		err = runPlaybook(client, remoteWorkDir, item.exercise, item.dir, item.exercise.Playbooks.Verification, nil)
-		if err == nil {
-			return operationResult{kind: operationStart, output: output.String(), connection: &connection, err: errors.New("verification неожиданно прошла после внесения инцидента")}
-		}
-		if !isExpectedVerificationFailure(err) {
-			return operationResult{kind: operationStart, output: output.String(), connection: &connection, err: fmt.Errorf("не удалось подтвердить ожидаемый провал verification: %w", err)}
-		}
-		fmt.Fprintln(&output, "verification завершилась с ненулевым кодом — ожидаемый результат.")
-		return operationResult{kind: operationStart, output: output.String(), connection: &connection}
+		return operationResult{kind: operationStart, output: "Веб-терминал: " + terminalURL}
 	}
 }
 
@@ -401,6 +496,22 @@ func openSSHTerminal(target vm.Connection) error {
 	}
 }
 
+func openBrowserURL(target string) error {
+	if strings.TrimSpace(target) == "" {
+		return errors.New("пустой URL веб-терминала")
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.Command("open", target).Run()
+	case "linux":
+		return exec.Command("xdg-open", target).Run()
+	case "windows":
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", target).Run()
+	default:
+		return fmt.Errorf("открытие браузера не поддерживается на %s", runtime.GOOS)
+	}
+}
+
 func (m tuiModel) View() string {
 	width := m.width
 	if width < 60 {
@@ -419,6 +530,8 @@ func (m tuiModel) View() string {
 		body = m.viewTip(width)
 	case screenSolution:
 		body = m.viewSolution(width)
+	case screenToken:
+		body = m.viewToken(width)
 	}
 	return header + "\n\n" + body
 }
@@ -446,7 +559,10 @@ func (m tuiModel) viewExercises(width int) string {
 		}
 		b.WriteString(line + "\n")
 	}
-	b.WriteString("\n" + mutedStyle.Render("↑/↓ выбрать   enter описание   q выход"))
+	b.WriteString("\n" + mutedStyle.Render("↑/↓ выбрать   enter описание   a токен   q выход"))
+	if m.status != "" {
+		b.WriteString("\n\n" + mutedStyle.Render(m.status))
+	}
 	return panelStyle.Width(max(30, width-4)).Render(b.String())
 }
 
@@ -456,10 +572,10 @@ func (m tuiModel) viewDescription(width int) string {
 	if item.err != nil {
 		content += "\n\n" + errorStyle.Render(item.err.Error())
 	}
-	if m.status != "" && m.returnTo == screenExercises {
-		content += "\n\n" + errorStyle.Render(m.status)
+	if m.status != "" {
+		content += "\n\n" + mutedStyle.Render(m.status)
 	}
-	footer := "\n\n" + mutedStyle.Render("j/k прокрутка   t подсказки   s начать решение   esc назад")
+	footer := "\n\n" + mutedStyle.Render("j/k прокрутка   t подсказки   a токен   s начать решение   esc назад")
 	return panelStyle.Width(max(30, width-4)).Render(content + footer)
 }
 
@@ -515,7 +631,26 @@ func (m tuiModel) viewSolution(width int) string {
 	}
 	content := titleStyle.Render("Решение · "+item.exercise.Name) + "\n\n" + state + "\n\n"
 	content += mutedStyle.Render("Последний вывод") + "\n" + logs + "\n\n"
-	content += mutedStyle.Render("d описание   t подсказки   c SSH-команда   o открыть SSH   v проверить   x выйти из решения   q выйти")
+	content += mutedStyle.Render("d описание   t подсказки   a токен   x выйти из решения   q выйти")
+	return panelStyle.Width(max(30, width-4)).Render(content)
+}
+
+func (m tuiModel) viewToken(width int) string {
+	content := titleStyle.Render("Токен VM service") + "\n\n"
+	if m.token != "" {
+		content += mutedStyle.Render(fmt.Sprintf("Токен установлен: %d (Unix time)", m.tokenInstalledAt)) + "\n\n"
+	} else {
+		content += mutedStyle.Render("Токен ещё не установлен.") + "\n\n"
+	}
+	masked := strings.Repeat("•", len([]rune(m.tokenInput)))
+	if masked == "" {
+		masked = mutedStyle.Render("введите токен")
+	}
+	content += "Токен: " + masked
+	if m.tokenError != "" {
+		content += "\n\n" + errorStyle.Render(m.tokenError)
+	}
+	content += "\n\n" + mutedStyle.Render("введите токен   enter сохранить   esc назад")
 	return panelStyle.Width(max(30, width-4)).Render(content)
 }
 

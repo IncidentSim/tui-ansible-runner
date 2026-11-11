@@ -55,12 +55,15 @@ func run(args []string) int {
 		return 0
 	}
 
-	source, provider, remoteWorkDir, providerErr := buildRuntime(*configPath)
+	source, provider, remoteWorkDir, tokenFile, providerErr := buildRuntime(*configPath)
 	if len(rest) == 0 || rest[0] == "tui" {
+		if providerErr != nil {
+			return fail(providerErr)
+		}
 		if len(rest) > 1 {
 			return fail(errors.New("tui does not accept arguments"))
 		}
-		if err := runTUI(source, provider, remoteWorkDir, providerErr); err != nil {
+		if err := runTUI(source, provider, remoteWorkDir, tokenFile); err != nil {
 			return fail(err)
 		}
 		return 0

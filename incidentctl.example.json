@@ -6,9 +6,11 @@
     "cache_dir": "~/.cache/incidentctl/exercises"
   },
   "vm_service": {
-    "base_url": "https://microvm.example/api",
+    "base_url": "https://petruekhin.tech:19453",
     "token_env": "INCIDENTCTL_MICROVM_TOKEN",
     "timeout_seconds": 30,
-    "remote_work_dir": "/var/tmp/incidentctl/exercises"
+    "remote_work_dir": "/var/tmp/incidentctl/exercises",
+    "image_id": "ubuntu-base",
+    "ttl_seconds": 3600
   }
 }

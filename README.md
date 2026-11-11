@@ -4,10 +4,10 @@
 Git-репозитория и обращается к VM service API. Локальный каталог заданий и
 подключение к локальной VM больше не являются вариантами запуска.
 
-Сейчас API-провайдер оставлен заглушкой: список заданий можно получить из
-удалённого репозитория, но операции `infra`, `incident`, `verify`, `connection`
-и `ssh-check` завершатся ошибкой `microVM service provider is not implemented`,
-пока API-клиент не будет реализован.
+TUI использует VM service API: при запуске проверяется `/v1/capabilities`, а
+при начале решения создаётся VM, после чего `/v1/vms/{id}/terminal` выдаёт URL
+веб-терминала, который открывается в браузере. SSH-код и проверка результата
+сохранены для совместимости, но их кнопки убраны из TUI.
 
 ## Требования
 
@@ -57,6 +57,12 @@ API. Секция `exercise_repository` задаёт repository, ref, катал
 `user_id_file` в `incidentctl.json`; этот ID будет передаваться будущему API
 как `user_id`.
 
+Токен вводится в TUI клавишей `a` на экране списка или описания задачи. Он
+сохраняется рядом с `user-id` в `token.json` с полями `token` и
+`installed_at` — Unix timestamp установки. Отсутствующий или некорректный
+токен не мешает загрузить список задач и выбрать задачу; он проверяется только
+при работе с VM service.
+
 ```bash
 bin/incidentctl -config incidentctl.json
 ```
@@ -67,8 +73,8 @@ bin/incidentctl -config incidentctl.json
 bin/incidentctl
 ```
 
-В секции `vm_service` токен не хранится: поле `token_env` содержит имя
-переменной окружения, из которой будущая реализация сможет получить токен.
+В секции `vm_service` токен не хранится: он вводится через TUI и сохраняется
+в системном файле рядом с `user-id`.
 
 ### Репозиторий упражнений
 
@@ -99,16 +105,24 @@ cd ..
 
 ```json
 "vm_service": {
-  "base_url": "https://microvm.example/api",
+  "base_url": "https://petruekhin.tech:19453",
   "token_env": "INCIDENTCTL_MICROVM_TOKEN",
   "timeout_seconds": 30,
-  "remote_work_dir": "/var/tmp/incidentctl/exercises"
+  "remote_work_dir": "/var/tmp/incidentctl/exercises",
+  "image_id": "ubuntu-base",
+  "ttl_seconds": 3600
 }
 ```
 
-HTTP-вызовы API пока не выполняются — провайдер намеренно возвращает явную
-ошибку-заглушку. Это оставляет единый контракт для будущего создания VM через
-сервис и исключает локальное развёртывание.
+Из OpenAPI сервиса используются `GET /v1/capabilities`, `POST /v1/vms`,
+`GET /v1/operations/{id}` и `POST /v1/vms/{id}/terminal`. Мутации возвращают
+операцию, поэтому клиент дожидается статуса `succeeded`. При HTTP 401 TUI
+сообщает, что токен просрочен, а ошибка создания VM показывается как:
+«сейчас сервер занят, попробуйте подключиться позже».
+
+`image_id` обязателен для создания VM. Токен передаётся в API как
+`Authorization: Bearer <token>`; для пользовательского JWT заголовок
+`X-Acting-User-ID` не добавляется согласно OpenAPI.
 
 ## Команды
 
@@ -116,7 +130,7 @@ HTTP-вызовы API пока не выполняются — провайде�
 # Открыть TUI; список загружается из удалённого Git-репозитория
 bin/incidentctl
 
-# Будущие операции через API
+# Legacy SSH-команды остаются доступны вне TUI
 bin/incidentctl infra nginx-wrong-api
 bin/incidentctl incident nginx-wrong-api
 bin/incidentctl verify nginx-wrong-api
@@ -128,8 +142,8 @@ bin/incidentctl verify nginx-wrong-api
 -config incidentctl.json
 ```
 
-Аргументы после `--` сохраняются для будущей передачи удалённому исполнителю
-playbook'ов.
+Аргументы после `--` сохраняются для передачи удалённому исполнителю
+playbook'ов в legacy SSH-потоке.
 
 ## Структура упражнения
 

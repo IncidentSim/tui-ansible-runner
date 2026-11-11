@@ -19,6 +19,7 @@ type Config struct {
 	ExerciseRepository ExerciseRepositoryConfig `json:"exercise_repository"`
 	VMService          MicroVMServiceConfig     `json:"vm_service"`
 	UserIDFile         string                   `json:"user_id_file,omitempty"`
+	TokenFile          string                   `json:"token_file,omitempty"`
 }
 
 type MicroVMServiceConfig struct {
@@ -26,6 +27,9 @@ type MicroVMServiceConfig struct {
 	TokenEnv       string `json:"token_env"`
 	TimeoutSeconds int    `json:"timeout_seconds"`
 	RemoteWorkDir  string `json:"remote_work_dir"`
+	ImageID        string `json:"image_id"`
+	Profile        string `json:"profile,omitempty"`
+	TTLSeconds     int    `json:"ttl_seconds,omitempty"`
 }
 
 type ExerciseRepositoryConfig struct {
