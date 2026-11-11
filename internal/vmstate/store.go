@@ -135,7 +135,7 @@ func (s *Store) OpenConnection(exercise string) (vm.Connection, func(), error) {
 	}
 	path := file.Name()
 	removeKey := func() { _ = os.Remove(path) }
-	if err := file.Chmod(0o600); err != nil {
+	if err := vm.ProtectSSHKey(file); err != nil {
 		_ = file.Close()
 		removeKey()
 		return vm.Connection{}, nil, fmt.Errorf("protect temporary SSH key: %w", err)
@@ -188,7 +188,7 @@ func (s *Store) persist() error {
 	}
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(0o600); err != nil {
+	if err := vm.ProtectSSHKey(temporary); err != nil {
 		_ = temporary.Close()
 		return fmt.Errorf("protect temporary VM state: %w", err)
 	}

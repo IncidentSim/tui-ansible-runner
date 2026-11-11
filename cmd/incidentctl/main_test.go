@@ -15,11 +15,13 @@ import (
 func TestRemoteBashScriptsHaveValidSyntax(t *testing.T) {
 	t.Parallel()
 	scripts := map[string]string{
-		"ssh-check":  sshCheckScript,
-		"connection": connectionIPScript,
-		"bootstrap":  bootstrapScript,
-		"upload":     uploadScript,
-		"playbook":   playbookScript,
+		"ssh-check":     sshCheckScript,
+		"connection":    connectionIPScript,
+		"bootstrap":     bootstrapScript,
+		"upload":        uploadScript,
+		"playbook":      playbookScript,
+		"audit-install": auditInstallScript,
+		"audit-control": auditControlScript,
 	}
 	for name, script := range scripts {
 		name, script := name, script

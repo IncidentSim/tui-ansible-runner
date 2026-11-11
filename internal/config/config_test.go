@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,6 +84,72 @@ func TestLoadUnifiedConfig(t *testing.T) {
 	}
 	if cfg.VMService.TimeoutSeconds != 30 || cfg.VMService.RemoteWorkDir == "" {
 		t.Fatalf("service defaults were not applied: %+v", cfg.VMService)
+	}
+	if cfg.Audit.LLMReportsDir != filepath.Join(filepath.Dir(path), "llm-reports") {
+		t.Fatalf("LLM report default: %s", cfg.Audit.LLMReportsDir)
+	}
+	if cfg.Audit.LLMConfig != "" {
+		t.Fatal("LLM must stay disabled when no profile is configured")
+	}
+	if cfg.Audit.Repository == nil || cfg.Audit.Repository.Ref != "main" || !filepath.IsAbs(cfg.Audit.Repository.CacheDir) {
+		t.Fatal("default audit repository missing")
+	}
+}
+
+func TestInlineAuditConfigurationDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "incidentctl.json")
+	cfg := Config{ExerciseRepository: ExerciseRepositoryConfig{Repository: "git@example.invalid:exercises.git", CacheDir: filepath.Join(dir, "cache")},
+		VMService: MicroVMServiceConfig{BaseURL: "https://example.invalid"}, Audit: AuditConfig{LLM: &LLMConfig{Enabled: true, APIKey: "test-key"}, Repository: &ExerciseRepositoryConfig{CacheDir: "agent-cache"}}}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Audit.LLM.APIKey != "test-key" || got.Audit.LLM.Model != "deepseek-flash" || got.Audit.LLM.MaxTokens != 4000 {
+		t.Fatal("inline LLM defaults incorrect")
+	}
+	if got.Audit.Repository.CacheDir != filepath.Join(dir, "agent-cache") {
+		t.Fatal("repository cache path not relative to config")
+	}
+}
+
+func TestLLMReportDirectoryResolvesRelativeToConfig(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "incidentctl.json")
+	for _, setting := range []string{"reports", filepath.Join(t.TempDir(), "absolute"), "~/incidentctl-test-reports"} {
+		cfg := Config{ExerciseRepository: ExerciseRepositoryConfig{Repository: "git@example.invalid:exercises.git", CacheDir: filepath.Join(dir, "cache")},
+			VMService: MicroVMServiceConfig{BaseURL: "https://example.invalid"}, Audit: AuditConfig{LLMReportsDir: setting, LLMConfig: filepath.Join(setting, "llm.json")}}
+		data, err := json.Marshal(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(configPath, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := Load(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := expandHome(setting)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !filepath.IsAbs(want) {
+			want = filepath.Join(dir, want)
+		}
+		if got.Audit.LLMReportsDir != want {
+			t.Fatalf("%s resolved to %s, want %s", setting, got.Audit.LLMReportsDir, want)
+		}
+		if got.Audit.LLMConfig != filepath.Join(want, "llm.json") {
+			t.Fatalf("unexpected LLM profile path: %s", got.Audit.LLMConfig)
+		}
 	}
 }
 

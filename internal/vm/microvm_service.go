@@ -240,7 +240,7 @@ func (p *MicroVMServiceProvider) connectionFromSSHMetadata(ctx context.Context, 
 	}
 	path := file.Name()
 	removeKey := func() { _ = os.Remove(path) }
-	if err := file.Chmod(0o600); err != nil {
+	if err := protectSSHKey(file); err != nil {
 		_ = file.Close()
 		removeKey()
 		return Connection{}, nil, fmt.Errorf("protect temporary SSH key: %w", err)

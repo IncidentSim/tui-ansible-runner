@@ -2,3 +2,7 @@
 	path = exersice
 	url = git@github.com:IncidentSim/exersice.git
 	branch = master
+[submodule "audit-agent"]
+	path = audit-agent
+	url = git@github.com:IncidentSim/audit-agent.git
+	branch = main

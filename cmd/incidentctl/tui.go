@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -67,6 +68,7 @@ type operationResult struct {
 	connection *vm.Connection
 	cleanup    func()
 	status     string
+	warning    string
 	err        error
 }
 
@@ -78,9 +80,11 @@ const (
 	solutionCreateVM
 	solutionConnectSSH
 	solutionPrepareAnsible
+	solutionPrepareAudit
 	solutionApplyInfra
 	solutionApplyIncident
 	solutionVerifyIncident
+	solutionStartAudit
 	solutionOpenTerminal
 )
 
@@ -92,9 +96,11 @@ var solutionStageNames = [...]string{
 	"Создание виртуальной машины",
 	"Подключение к SSH",
 	"Подготовка Ansible",
+	"Установка audit-agent",
 	"Применение infra",
 	"Применение incident",
 	"Проверка инцидента",
+	"Начало записи действий",
 	"Открытие веб-терминала",
 }
 
@@ -114,6 +120,7 @@ type solutionRun struct {
 	client        *remote.Client
 	output        bytes.Buffer
 	terminalURL   string
+	audit         auditOptions
 }
 
 type solutionStageResult struct {
@@ -159,6 +166,7 @@ type tuiModel struct {
 	tokenInstalledAt  int64
 	tokenReturn       tuiScreen
 	tokenError        string
+	audit             auditOptions
 }
 
 var (
@@ -171,7 +179,7 @@ var (
 	panelStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#465166")).Padding(0, 1)
 )
 
-func runTUI(source exercises.Source, provider vm.ConnectionProvider, remoteWorkDir, tokenFile string) error {
+func runTUI(source exercises.Source, provider vm.ConnectionProvider, remoteWorkDir, tokenFile string, audit auditOptions) error {
 	loaded, err := source.List(context.Background())
 	if err != nil {
 		return err
@@ -196,6 +204,7 @@ func runTUI(source exercises.Source, provider vm.ConnectionProvider, remoteWorkD
 	}
 	model := tuiModel{
 		provider:      provider,
+		audit:         audit,
 		remoteWorkDir: remoteWorkDir,
 		vmState:       state,
 		exercises:     items,
@@ -267,9 +276,16 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.solutionFailed = true
 			m.solutionFailure = msg.stage
 			m.busy = false
-			m.adoptSolutionConnection(msg.run)
+			if msg.stage == solutionOpenTerminal {
+				m.adoptSolutionConnection(msg.run)
+			} else if msg.run.cleanup != nil {
+				msg.run.cleanup()
+				msg.run.cleanup = nil
+			}
 			if errors.Is(msg.err, vm.ErrTokenExpired) {
 				m.status = tokenExpiredMessage
+			} else if msg.stage == solutionVerifyIncident && isSSHTransportFailure(msg.err) {
+				m.status = "Ошибка SSH: потеряна связь с VM " + msg.run.instance.ID + ". Нажмите p, чтобы повторить проверку инцидента на той же VM."
 			} else if msg.stage == solutionCheckCapabilities || msg.stage == solutionCreateVM || msg.stage == solutionConnectSSH || msg.stage == solutionOpenTerminal {
 				m.status = serverBusyMessage
 			} else {
@@ -297,6 +313,9 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.startSolutionStage(solutionPrepareAnsible, "Устанавливаю всё необходимое для Ansible…")
 			return m, msg.run.prepareAnsibleCmd()
 		case solutionPrepareAnsible:
+			m.startSolutionStage(solutionPrepareAudit, "Устанавливаю audit-agent…")
+			return m, msg.run.prepareAuditCmd()
+		case solutionPrepareAudit:
 			m.startSolutionStage(solutionApplyInfra, "Применяю инфраструктурный playbook…")
 			return m, msg.run.applyInfraCmd()
 		case solutionApplyInfra:
@@ -306,13 +325,16 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.startSolutionStage(solutionVerifyIncident, "Проверяю, что инцидент воспроизведён…")
 			return m, msg.run.verifyIncidentCmd()
 		case solutionVerifyIncident:
+			m.startSolutionStage(solutionStartAudit, "Начинаю запись действий…")
+			return m, msg.run.startAuditCmd()
+		case solutionStartAudit:
 			m.startSolutionStage(solutionOpenTerminal, "Инфраструктура подтверждена. Открываю веб-терминал…")
 			return m, msg.run.openTerminalCmd()
 		case solutionOpenTerminal:
 			m.busy = false
 			m.logs = msg.run.output.String()
 			m.adoptSolutionConnection(msg.run)
-			m.status = "Задача готова: инфраструктура и инцидент применены, веб-терминал открыт."
+			m.status = "Задача готова: запись действий включена, веб-терминал открыт."
 		}
 		return m, nil
 	case operationResult:
@@ -324,7 +346,14 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.sshCleanup = msg.cleanup
 		}
 		if msg.err != nil {
-			m.status = "Ошибка: " + msg.err.Error()
+			if msg.kind == operationVerify && isRejectedVerification(msg.err) {
+				m.status = "Решение пока не прошло проверку Ansible. Можно продолжить работу."
+			} else {
+				m.status = "Ошибка: " + msg.err.Error()
+			}
+			if msg.warning != "" {
+				m.status += "\nПредупреждение: " + msg.warning
+			}
 			return m, nil
 		}
 		if msg.status != "" {
@@ -339,9 +368,12 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = "Задача готова: инфраструктура создана, инцидент внесён, проверка ожидаемо падает."
 			}
 		case operationVerify:
-			m.status = "Проверка решения прошла успешно."
+			m.status = "Проверка решения прошла успешно. Запись событий включена."
 		case operationOpenSSH:
 			m.status = "SSH-сессия открыта в отдельном окне терминала."
+		}
+		if msg.warning != "" {
+			m.status += "\nПредупреждение: " + msg.warning
 		}
 		return m, nil
 	case tea.KeyMsg:
@@ -433,6 +465,10 @@ func (m tuiModel) updateKey(key string) (tea.Model, tea.Cmd) {
 			return m.openSSH()
 		case "v":
 			return m.verifySolution()
+		case "p":
+			if m.solutionFailed && m.solutionFailure == solutionVerifyIncident && m.solution != nil {
+				return m.retryIncidentCheck()
+			}
 		case "a":
 			return m.startTokenInput(screenSolution)
 		case "x", "esc":
@@ -520,11 +556,13 @@ func (m tuiModel) startSolution() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	run := &solutionRun{
+		audit:         m.audit,
 		provider:      apiProvider,
 		item:          item,
 		remoteWorkDir: m.remoteWorkDir,
 		state:         m.vmState,
 	}
+	m.releaseSSH()
 	m.solution = run
 	m.solutionDurations = [solutionStageCount]time.Duration{}
 	m.solutionDone = [solutionStageCount]bool{}
@@ -581,6 +619,7 @@ func (r *solutionRun) createVMCmd() tea.Cmd {
 		if err == nil {
 			r.instance = instance
 			err = r.state.SaveVM(r.item.exercise.Name, instance.ID)
+			fmt.Fprintf(&r.output, "VM ID: %s\n", instance.ID)
 		}
 		return solutionStageResult{run: r, stage: solutionCreateVM, err: err}
 	}
@@ -588,27 +627,60 @@ func (r *solutionRun) createVMCmd() tea.Cmd {
 
 func (r *solutionRun) connectSSHCmd() tea.Cmd {
 	return func() tea.Msg {
-		var connection vm.Connection
-		var cleanup func()
 		var err error
 		if r.savedRecord.SSH != nil {
+			var connection vm.Connection
+			var cleanup func()
 			connection, cleanup, err = r.state.OpenConnection(r.item.exercise.Name)
-		} else {
-			connection, cleanup, err = r.provider.SSHConnection(context.Background(), r.instance.ID)
 			if err == nil {
-				err = r.state.SaveSSH(r.item.exercise.Name, connection)
+				r.connection, r.cleanup = connection, cleanup
+				r.client = remote.NewWithWriters(connection, &r.output, &r.output)
 			}
-		}
-		if err != nil && cleanup != nil {
-			cleanup()
-			cleanup = nil
-		}
-		if err == nil {
-			r.connection, r.cleanup = connection, cleanup
-			r.client = remote.NewWithWriters(connection, &r.output, &r.output)
+		} else {
+			err = r.refreshSSH()
 		}
 		return solutionStageResult{run: r, stage: solutionConnectSSH, err: err}
 	}
+}
+
+func (r *solutionRun) refreshSSH() error {
+	connection, cleanup, err := r.provider.SSHConnection(context.Background(), r.instance.ID)
+	if err != nil {
+		return err
+	}
+	if r.state != nil {
+		if err := r.state.SaveSSH(r.item.exercise.Name, connection); err != nil {
+			if cleanup != nil {
+				cleanup()
+			}
+			return err
+		}
+	}
+	if r.cleanup != nil {
+		r.cleanup()
+	}
+	r.connection, r.cleanup = connection, cleanup
+	r.client = remote.NewWithWriters(connection, &r.output, &r.output)
+	return nil
+}
+
+func (m tuiModel) retryIncidentCheck() (tea.Model, tea.Cmd) {
+	run := m.solution
+	m.busy, m.solutionFailed = true, false
+	m.solutionDone[solutionVerifyIncident] = false
+	m.startSolutionStage(solutionVerifyIncident, "Восстанавливаю SSH и повторяю проверку инцидента…")
+	return m, tea.Batch(func() tea.Msg {
+		fmt.Fprintf(&run.output, "\nПовторная проверка инцидента на VM %s\n", run.instance.ID)
+		if err := run.refreshSSH(); err != nil {
+			return solutionStageResult{run: run, stage: solutionVerifyIncident, err: fmt.Errorf("refresh SSH metadata: %w", err)}
+		}
+		return run.verifyIncidentCmd()()
+	}, spinnerTickCmd())
+}
+
+func isSSHTransportFailure(err error) bool {
+	var commandErr *remote.CommandError
+	return errors.As(err, &commandErr) && commandErr.ExitCode == 255
 }
 
 func (r *solutionRun) prepareAnsibleCmd() tea.Cmd {
@@ -624,6 +696,20 @@ func (r *solutionRun) prepareAnsibleCmd() tea.Cmd {
 
 func (r *solutionRun) applyInfraCmd() tea.Cmd {
 	return r.applyPlaybookCmd(solutionApplyInfra, "Создание инфраструктуры", r.item.exercise.Playbooks.Infra)
+}
+
+func (r *solutionRun) prepareAuditCmd() tea.Cmd {
+	return func() tea.Msg {
+		err := r.audit.prepare(r.client, r.remoteWorkDir, r.item.exercise.Name)
+		return solutionStageResult{run: r, stage: solutionPrepareAudit, err: err}
+	}
+}
+
+func (r *solutionRun) startAuditCmd() tea.Cmd {
+	return func() tea.Msg {
+		err := r.audit.start(r.client, r.remoteWorkDir, r.item.exercise.Name)
+		return solutionStageResult{run: r, stage: solutionStartAudit, err: err}
+	}
 }
 
 func (r *solutionRun) applyIncidentCmd() tea.Cmd {
@@ -663,7 +749,7 @@ func (r *solutionRun) openTerminalCmd() tea.Cmd {
 		if err != nil {
 			return solutionStageResult{run: r, stage: solutionOpenTerminal, err: fmt.Errorf("не удалось открыть веб-терминал: %w", err)}
 		}
-		fmt.Fprintln(&r.output, "\nВеб-терминал открыт: "+terminalURL)
+		fmt.Fprintf(&r.output, "\nVM ID: %s\nВеб-терминал открыт: %s\n", r.instance.ID, terminalURL)
 		return solutionStageResult{run: r, stage: solutionOpenTerminal}
 	}
 }
@@ -700,14 +786,31 @@ func (m tuiModel) verifySolution() (tea.Model, tea.Cmd) {
 		m.status = "Проверка недоступна: подключение к VM ещё не получено"
 		return m, nil
 	}
-	item, connection, remoteWorkDir := m.current(), *m.connection, m.remoteWorkDir
+	item, connection, remoteWorkDir, audit := m.current(), *m.connection, m.remoteWorkDir, m.audit
 	m.busy, m.status = true, "Проверяю решение…"
 	return m, func() tea.Msg {
 		var output bytes.Buffer
 		client := remote.NewWithWriters(connection, &output, &output)
-		err := runPlaybook(client, remoteWorkDir, item.exercise, item.dir, item.exercise.Playbooks.Verification, nil)
-		return operationResult{kind: operationVerify, output: output.String(), err: err}
+		var warning string
+		audit.OnWarning = func(message string) { warning = message }
+		err := audit.verify(client, remoteWorkDir, item.exercise.Name, item.dir, &output, func(out io.Writer) error {
+			return runPlaybook(remote.NewWithWriters(connection, out, out), remoteWorkDir, item.exercise, item.dir, item.exercise.Playbooks.Verification, nil)
+		})
+		return operationResult{kind: operationVerify, output: output.String(), warning: warning, err: err}
 	}
+}
+
+// Ansible uses 2 when a task failed; transport, upload and execution failures
+// remain technical errors and must not be presented as a rejected solution.
+func isRejectedVerification(err error) bool {
+	var resumeErr *recordingResumeError
+	if errors.As(err, &resumeErr) {
+		return false
+	}
+	var runErr *playbookRunError
+	var commandErr *remote.CommandError
+	return errors.As(err, &runErr) && runErr.Phase == "execute playbook" &&
+		errors.As(err, &commandErr) && commandErr.ExitCode == 2
 }
 
 func (m tuiModel) openSSH() (tea.Model, tea.Cmd) {
@@ -906,7 +1009,7 @@ func (m tuiModel) viewSolution(width int) string {
 	state := m.status
 	if m.busy {
 		state = spinnerFrames[m.spinnerFrame] + " " + state
-	} else if strings.HasPrefix(state, "Ошибка") {
+	} else if strings.HasPrefix(state, "Ошибка") || strings.HasPrefix(state, "Решение пока не прошло") {
 		state = errorStyle.Render(state)
 	} else if state != "" {
 		state = successStyle.Render(state)
@@ -922,7 +1025,10 @@ func (m tuiModel) viewSolution(width int) string {
 	content := titleStyle.Render("Решение · "+item.exercise.Name) + "\n\n" + state + "\n\n"
 	content += m.viewSolutionStages() + "\n"
 	content += mutedStyle.Render("Последний вывод") + "\n" + logs + "\n\n"
-	content += mutedStyle.Render("d описание   t подсказки   a токен   x выйти из решения   q выйти")
+	content += mutedStyle.Render("d описание   t подсказки   v проверить   a токен   x выйти из решения   q выйти")
+	if m.solutionFailed && m.solutionFailure == solutionVerifyIncident {
+		content += "\n" + mutedStyle.Render("p повторить проверку инцидента на той же VM")
+	}
 	return panelStyle.Width(max(30, width-4)).Render(content)
 }
 

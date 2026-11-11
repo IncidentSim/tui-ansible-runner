@@ -3,3 +3,6 @@ incidentctl.json
 
 # Local build output.
 /bin/
+/analysis/
+/llm-reports/
+/.cache/

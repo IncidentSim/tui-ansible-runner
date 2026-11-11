@@ -7,18 +7,39 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
 )
 
 var safeName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$`)
+var safeEnvironmentName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 type Config struct {
 	ExerciseRepository ExerciseRepositoryConfig `json:"exercise_repository"`
 	VMService          MicroVMServiceConfig     `json:"vm_service"`
 	UserIDFile         string                   `json:"user_id_file,omitempty"`
 	TokenFile          string                   `json:"token_file,omitempty"`
+	Audit              AuditConfig              `json:"audit,omitempty"`
+}
+
+type AuditConfig struct {
+	LLMReportsDir string                    `json:"llm_reports_dir"`
+	LLMConfig     string                    `json:"llm_config,omitempty"`
+	Repository    *ExerciseRepositoryConfig `json:"repository,omitempty"`
+	LLM           *LLMConfig                `json:"llm,omitempty"`
+}
+
+type LLMConfig struct {
+	Enabled        bool   `json:"enabled"`
+	APIKey         string `json:"api_key,omitempty"`
+	APIKeyEnv      string `json:"api_key_env,omitempty"`
+	BaseURL        string `json:"base_url"`
+	Model          string `json:"model"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+	MaxTokens      int    `json:"max_tokens"`
+	ProxyMode      string `json:"proxy_mode"`
 }
 
 type MicroVMServiceConfig struct {
@@ -94,6 +115,109 @@ func Load(path string) (Config, error) {
 		return cfg, err
 	}
 	cfg.ExerciseRepository.CacheDir = cacheDir
+	if cfg.Audit.Repository == nil {
+		cfg.Audit.Repository = &ExerciseRepositoryConfig{}
+	}
+	repo := cfg.Audit.Repository
+	if repo.Repository == "" {
+		repo.Repository = "git@github.com:IncidentSim/audit-agent.git"
+	}
+	if repo.Ref == "" {
+		repo.Ref = "main"
+	}
+	if repo.Subdirectory == "" {
+		repo.Subdirectory = "."
+	}
+	if repo.CacheDir == "" {
+		repo.CacheDir = "~/.cache/incidentctl/audit-agent"
+	}
+	repo.CacheDir, err = expandHome(repo.CacheDir)
+	if err != nil {
+		return cfg, err
+	}
+	if !filepath.IsAbs(repo.CacheDir) {
+		repo.CacheDir = filepath.Join(filepath.Dir(path), repo.CacheDir)
+	}
+	repo.CacheDir, err = filepath.Abs(repo.CacheDir)
+	if err != nil {
+		return cfg, err
+	}
+	if err := repo.Validate(); err != nil {
+		return cfg, fmt.Errorf("audit.repository: %w", err)
+	}
+	if strings.HasPrefix(repo.Repository, "-") || strings.HasPrefix(repo.Ref, "-") {
+		return cfg, errors.New("audit repository and ref must not start with a dash")
+	}
+	if llm := cfg.Audit.LLM; llm != nil {
+		if llm.APIKeyEnv == "" {
+			llm.APIKeyEnv = "DEEPSEEK_API_KEY"
+		}
+		if llm.BaseURL == "" {
+			llm.BaseURL = "https://api.deepseek.com"
+		}
+		if llm.Model == "" {
+			llm.Model = "deepseek-flash"
+		}
+		if llm.TimeoutSeconds == 0 {
+			llm.TimeoutSeconds = 120
+		}
+		if llm.MaxTokens == 0 {
+			llm.MaxTokens = 4000
+		}
+		if llm.ProxyMode == "" {
+			llm.ProxyMode = "environment"
+		}
+		endpoint, err := url.Parse(llm.BaseURL)
+		if err != nil || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" ||
+			(endpoint.Scheme != "https" && !(endpoint.Scheme == "http" && (endpoint.Hostname() == "localhost" || endpoint.Hostname() == "127.0.0.1" || endpoint.Hostname() == "::1"))) {
+			return cfg, errors.New("audit.llm.base_url must be HTTPS without credentials; HTTP is allowed on loopback")
+		}
+		if llm.TimeoutSeconds < 1 || llm.MaxTokens < 1 || strings.TrimSpace(llm.Model) == "" {
+			return cfg, errors.New("audit.llm model, timeout_seconds and max_tokens must be valid")
+		}
+		if !safeEnvironmentName.MatchString(llm.APIKeyEnv) {
+			return cfg, errors.New("audit.llm.api_key_env must be an environment variable name")
+		}
+		if strings.ContainsAny(llm.APIKey, " \t\r\n") {
+			return cfg, errors.New("audit.llm.api_key must be a single token without whitespace")
+		}
+		if llm.ProxyMode != "environment" && llm.ProxyMode != "direct" {
+			return cfg, errors.New("audit.llm.proxy_mode must be environment or direct")
+		}
+	}
+	if cfg.Audit.LLMReportsDir == "" {
+		cfg.Audit.LLMReportsDir = "llm-reports"
+	}
+	if strings.TrimSpace(cfg.Audit.LLMReportsDir) == "" || strings.ContainsAny(cfg.Audit.LLMReportsDir, "\r\n") {
+		return cfg, errors.New("audit.llm_reports_dir must be a nonempty directory path without line breaks")
+	}
+	llmReportsDir, err := expandHome(cfg.Audit.LLMReportsDir)
+	if err != nil {
+		return cfg, err
+	}
+	if !filepath.IsAbs(llmReportsDir) {
+		llmReportsDir = filepath.Join(filepath.Dir(path), llmReportsDir)
+	}
+	cfg.Audit.LLMReportsDir, err = filepath.Abs(llmReportsDir)
+	if err != nil {
+		return cfg, err
+	}
+	if cfg.Audit.LLMConfig != "" {
+		if strings.TrimSpace(cfg.Audit.LLMConfig) == "" || strings.ContainsAny(cfg.Audit.LLMConfig, "\r\n") {
+			return cfg, errors.New("audit.llm_config must be a file path without line breaks")
+		}
+		llmConfig, err := expandHome(cfg.Audit.LLMConfig)
+		if err != nil {
+			return cfg, err
+		}
+		if !filepath.IsAbs(llmConfig) {
+			llmConfig = filepath.Join(filepath.Dir(path), llmConfig)
+		}
+		cfg.Audit.LLMConfig, err = filepath.Abs(llmConfig)
+		if err != nil {
+			return cfg, err
+		}
+	}
 	if err := cfg.VMService.Validate(); err != nil {
 		return cfg, fmt.Errorf("vm_service: %w", err)
 	}
@@ -129,7 +253,7 @@ func (c MicroVMServiceConfig) Validate() error {
 	if c.TimeoutSeconds < 1 {
 		return errors.New("timeout_seconds must be positive")
 	}
-	if !safeAbsolutePath(c.RemoteWorkDir) {
+	if !path.IsAbs(c.RemoteWorkDir) || path.Clean(c.RemoteWorkDir) == "/" || strings.ContainsAny(c.RemoteWorkDir, "\r\n") {
 		return errors.New("remote_work_dir must be an absolute path other than /")
 	}
 	return nil
@@ -227,7 +351,7 @@ func safeAbsolutePath(value string) bool {
 }
 
 func expandHome(value string) (string, error) {
-	if value == "~" || strings.HasPrefix(value, "~/") {
+	if value == "~" || strings.HasPrefix(value, "~/") || (filepath.Separator == '\\' && strings.HasPrefix(value, "~\\")) {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return "", fmt.Errorf("resolve home directory: %w", err)
@@ -235,7 +359,7 @@ func expandHome(value string) (string, error) {
 		if value == "~" {
 			return home, nil
 		}
-		return filepath.Join(home, strings.TrimPrefix(value, "~/")), nil
+		return filepath.Join(home, value[2:]), nil
 	}
 	return value, nil
 }

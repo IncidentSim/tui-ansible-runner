@@ -5,6 +5,25 @@
     "subdirectory": ".",
     "cache_dir": "~/.cache/incidentctl/exercises"
   },
+  "audit": {
+    "llm_reports_dir": "llm-reports",
+    "repository": {
+      "repository": "git@github.com:IncidentSim/audit-agent.git",
+      "ref": "main",
+      "subdirectory": ".",
+      "cache_dir": "~/.cache/incidentctl/audit-agent"
+    },
+    "llm": {
+      "enabled": true,
+      "api_key": "",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "base_url": "https://api.deepseek.com",
+      "model": "deepseek-flash",
+      "timeout_seconds": 120,
+      "max_tokens": 4000,
+      "proxy_mode": "direct"
+    }
+  },
   "vm_service": {
     "base_url": "https://petruekhin.tech:19453",
     "timeout_seconds": 30,
