@@ -20,6 +20,7 @@ import (
 	"incidentctl/internal/identity"
 	"incidentctl/internal/remote"
 	"incidentctl/internal/vm"
+	"incidentctl/internal/vmstate"
 )
 
 const incidentSimLogo = `  ___           _     _            _   ____  _
@@ -73,6 +74,7 @@ type solutionStage int
 
 const (
 	solutionCheckCapabilities solutionStage = iota
+	solutionFindVM
 	solutionCreateVM
 	solutionConnectSSH
 	solutionPrepareAnsible
@@ -86,6 +88,7 @@ const solutionStageCount = int(solutionOpenTerminal) + 1
 
 var solutionStageNames = [...]string{
 	"Проверка токена",
+	"Поиск сохранённой виртуальной машины",
 	"Создание виртуальной машины",
 	"Подключение к SSH",
 	"Подготовка Ansible",
@@ -103,7 +106,9 @@ type solutionRun struct {
 	provider      vm.APIProvider
 	item          exerciseItem
 	remoteWorkDir string
+	state         *vmstate.Store
 	instance      vm.VirtualMachine
+	savedRecord   vmstate.Record
 	connection    vm.Connection
 	cleanup       func()
 	client        *remote.Client
@@ -125,6 +130,7 @@ const (
 type tuiModel struct {
 	provider          vm.ConnectionProvider
 	remoteWorkDir     string
+	vmState           *vmstate.Store
 	connection        *vm.Connection
 	sshCleanup        func()
 	solution          *solutionRun
@@ -170,6 +176,10 @@ func runTUI(source exercises.Source, provider vm.ConnectionProvider, remoteWorkD
 	if err != nil {
 		return err
 	}
+	state, err := vmstate.Load("")
+	if err != nil {
+		return err
+	}
 	items := make([]exerciseItem, 0, len(loaded))
 	for _, item := range loaded {
 		tips := make([]tip, 0, len(item.Tips))
@@ -187,6 +197,7 @@ func runTUI(source exercises.Source, provider vm.ConnectionProvider, remoteWorkD
 	model := tuiModel{
 		provider:      provider,
 		remoteWorkDir: remoteWorkDir,
+		vmState:       state,
 		exercises:     items,
 		screen:        screenExercises,
 		returnTo:      screenExercises,
@@ -210,6 +221,9 @@ func runTUI(source exercises.Source, provider vm.ConnectionProvider, remoteWorkD
 	}
 	_, runErr := tea.NewProgram(model, tea.WithAltScreen()).Run()
 	cleanupErr := cleanupVMs(context.Background(), provider)
+	if cleanupErr == nil {
+		cleanupErr = state.Clear()
+	}
 	return errors.Join(runErr, cleanupErr)
 }
 
@@ -267,6 +281,13 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.completeSolutionStage(msg.stage)
 		switch msg.stage {
 		case solutionCheckCapabilities:
+			m.startSolutionStage(solutionFindVM, "Проверяю сохранённую виртуальную машину…")
+			return m, msg.run.findVMCmd()
+		case solutionFindVM:
+			if msg.run.instance.ID != "" {
+				m.startSolutionStage(solutionConnectSSH, "Подключаюсь к сохранённой виртуальной машине…")
+				return m, msg.run.connectSSHCmd()
+			}
 			m.startSolutionStage(solutionCreateVM, "Создаю виртуальную машину…")
 			return m, msg.run.createVMCmd()
 		case solutionCreateVM:
@@ -494,10 +515,15 @@ func (m tuiModel) startSolution() (tea.Model, tea.Cmd) {
 		m.status = "Провайдер VM не поддерживает API создания виртуальной машины"
 		return m, nil
 	}
+	if m.vmState == nil {
+		m.status = "Нельзя начать: не удалось загрузить состояние виртуальных машин"
+		return m, nil
+	}
 	run := &solutionRun{
 		provider:      apiProvider,
 		item:          item,
 		remoteWorkDir: m.remoteWorkDir,
+		state:         m.vmState,
 	}
 	m.solution = run
 	m.solutionDurations = [solutionStageCount]time.Duration{}
@@ -534,11 +560,27 @@ func (r *solutionRun) checkCapabilitiesCmd() tea.Cmd {
 	}
 }
 
+func (r *solutionRun) findVMCmd() tea.Cmd {
+	return func() tea.Msg {
+		record, ok := r.state.Lookup(r.item.exercise.Name)
+		if !ok {
+			return solutionStageResult{run: r, stage: solutionFindVM}
+		}
+		if strings.TrimSpace(record.VMID) == "" {
+			return solutionStageResult{run: r, stage: solutionFindVM, err: fmt.Errorf("saved VM for exercise %q has no VM id", r.item.exercise.Name)}
+		}
+		r.savedRecord = record
+		r.instance = vm.VirtualMachine{ID: record.VMID}
+		return solutionStageResult{run: r, stage: solutionFindVM}
+	}
+}
+
 func (r *solutionRun) createVMCmd() tea.Cmd {
 	return func() tea.Msg {
 		instance, err := r.provider.CreateVM(context.Background(), vm.RequestFromExercise(r.item.exercise))
 		if err == nil {
 			r.instance = instance
+			err = r.state.SaveVM(r.item.exercise.Name, instance.ID)
 		}
 		return solutionStageResult{run: r, stage: solutionCreateVM, err: err}
 	}
@@ -546,7 +588,21 @@ func (r *solutionRun) createVMCmd() tea.Cmd {
 
 func (r *solutionRun) connectSSHCmd() tea.Cmd {
 	return func() tea.Msg {
-		connection, cleanup, err := r.provider.SSHConnection(context.Background(), r.instance.ID)
+		var connection vm.Connection
+		var cleanup func()
+		var err error
+		if r.savedRecord.SSH != nil {
+			connection, cleanup, err = r.state.OpenConnection(r.item.exercise.Name)
+		} else {
+			connection, cleanup, err = r.provider.SSHConnection(context.Background(), r.instance.ID)
+			if err == nil {
+				err = r.state.SaveSSH(r.item.exercise.Name, connection)
+			}
+		}
+		if err != nil && cleanup != nil {
+			cleanup()
+			cleanup = nil
+		}
 		if err == nil {
 			r.connection, r.cleanup = connection, cleanup
 			r.client = remote.NewWithWriters(connection, &r.output, &r.output)

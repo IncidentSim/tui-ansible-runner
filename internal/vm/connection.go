@@ -17,6 +17,7 @@ type Connection struct {
 	Bastion               *Bastion
 	Password              *string
 	IdentityFile          string
+	PrivateKey            string
 	StrictHostKeyChecking bool
 }
 

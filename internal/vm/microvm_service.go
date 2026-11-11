@@ -263,6 +263,7 @@ func (p *MicroVMServiceProvider) connectionFromSSHMetadata(ctx context.Context, 
 		Port:                  metadata.Port,
 		User:                  metadata.User,
 		IdentityFile:          path,
+		PrivateKey:            key.PrivateKey,
 		Bastion:               bastion,
 		StrictHostKeyChecking: false,
 	}, removeKey, nil
