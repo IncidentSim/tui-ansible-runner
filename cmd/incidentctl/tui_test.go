@@ -1,40 +1,13 @@
 package main
 
 import (
-	"context"
 	"errors"
-	"path/filepath"
 	"strings"
 	"testing"
 
-	"incidentctl/internal/exercises"
 	"incidentctl/internal/remote"
 	"incidentctl/internal/vm"
 )
-
-func TestDiscoverExercisesLoadsDescriptionAndTips(t *testing.T) {
-	t.Parallel()
-	items, err := exercises.NewLocalSource(filepath.Join("..", "..", exerciseRoot)).List(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(items) == 0 {
-		t.Fatal("expected at least one exercise")
-	}
-	item := items[0]
-	if item.Err != nil {
-		t.Fatalf("exercise is invalid: %v", item.Err)
-	}
-	if item.Description == "" || len(item.Tips) == 0 {
-		t.Fatalf("description or tips were not loaded: description=%t tips=%d", item.Description != "", len(item.Tips))
-	}
-	if filepath.Base(item.Dir) != item.Exercise.Name {
-		t.Fatalf("directory %q does not match exercise %q", item.Dir, item.Exercise.Name)
-	}
-	if item.Exercise.Name == "skills" {
-		t.Fatal("skills directory must not be treated as an exercise")
-	}
-}
 
 func TestExpectedVerificationFailureRequiresPlaybookExit(t *testing.T) {
 	t.Parallel()

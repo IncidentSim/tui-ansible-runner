@@ -5,39 +5,19 @@ import (
 
 	"incidentctl/internal/config"
 	"incidentctl/internal/exercises"
+	"incidentctl/internal/identity"
 	"incidentctl/internal/vm"
 )
 
-func buildConnectionProvider(providerName, directConfigPath, microVMConfigPath string) (vm.ConnectionProvider, string, error) {
-	switch providerName {
-	case "direct":
-		cfg, err := config.Load(directConfigPath)
-		if err != nil {
-			return nil, "", err
-		}
-		return vm.NewDirectProvider(cfg.Target), cfg.Paths.RemoteWorkDir, nil
-	case "microvm-service":
-		cfg, err := config.LoadMicroVMService(microVMConfigPath)
-		if err != nil {
-			return nil, "", err
-		}
-		return vm.NewMicroVMServiceProvider(cfg), cfg.RemoteWorkDir, nil
-	default:
-		return nil, "", fmt.Errorf("unknown VM provider %q (want direct or microvm-service)", providerName)
+func buildRuntime(configPath string) (exercises.Source, vm.ConnectionProvider, string, error) {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return nil, nil, "", err
 	}
-}
-
-func buildExerciseSource(sourceName, localRoot, repositoryConfigPath string) (exercises.Source, error) {
-	switch sourceName {
-	case "local":
-		return exercises.NewLocalSource(localRoot), nil
-	case "git":
-		cfg, err := config.LoadExerciseRepository(repositoryConfigPath)
-		if err != nil {
-			return nil, err
-		}
-		return exercises.NewGitSource(cfg), nil
-	default:
-		return nil, fmt.Errorf("unknown exercise source %q (want local or git)", sourceName)
+	userID, err := identity.LoadOrCreate(cfg.UserIDFile)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("load user ID: %w", err)
 	}
+	return exercises.NewGitSource(cfg.ExerciseRepository),
+		vm.NewMicroVMServiceProviderWithUserID(cfg.VMService, userID), cfg.VMService.RemoteWorkDir, nil
 }

@@ -21,15 +21,6 @@ func TestSafeName(t *testing.T) {
 	}
 }
 
-func TestConfigValidateRejectsRootWorkDirectory(t *testing.T) {
-	t.Parallel()
-	cfg := validConfig(t)
-	cfg.Paths.RemoteWorkDir = "/"
-	if err := cfg.Validate(); err == nil {
-		t.Fatal("expected root work directory to be rejected")
-	}
-}
-
 func TestExerciseValidateRejectsTraversal(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -69,6 +60,33 @@ func TestMicroVMServiceConfigValidate(t *testing.T) {
 	}
 }
 
+func TestLoadUnifiedConfig(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "incidentctl.json")
+	data := []byte(`{
+  "exercise_repository": {
+    "repository": "git@example.invalid:incidents.git",
+    "cache_dir": "~/cache/incidentctl"
+  },
+  "vm_service": {
+    "base_url": "https://microvm.example/api"
+  }
+}`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ExerciseRepository.Ref != "main" || cfg.ExerciseRepository.Subdirectory != "exersice" {
+		t.Fatalf("repository defaults were not applied: %+v", cfg.ExerciseRepository)
+	}
+	if cfg.VMService.TimeoutSeconds != 30 || cfg.VMService.RemoteWorkDir == "" {
+		t.Fatalf("service defaults were not applied: %+v", cfg.VMService)
+	}
+}
+
 func TestExerciseRepositoryConfigRejectsTraversal(t *testing.T) {
 	t.Parallel()
 	cfg := ExerciseRepositoryConfig{
@@ -79,18 +97,6 @@ func TestExerciseRepositoryConfigRejectsTraversal(t *testing.T) {
 	}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("repository subdirectory traversal must be rejected")
-	}
-}
-
-func validConfig(t *testing.T) Config {
-	t.Helper()
-	key := filepath.Join(t.TempDir(), "id_ed25519")
-	if err := os.WriteFile(key, []byte("test"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return Config{
-		Target: TargetConfig{Host: "vm.example", Port: 22, User: "root", IdentityFile: key},
-		Paths:  PathsConfig{RemoteWorkDir: "/var/tmp/incidentctl/exercises"},
 	}
 }
 

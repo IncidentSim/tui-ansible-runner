@@ -10,30 +10,7 @@ import (
 	"incidentctl/internal/config"
 )
 
-func TestLocalSourceListsExercisesAndIgnoresMetadataDirectories(t *testing.T) {
-	t.Parallel()
-	root := t.TempDir()
-	writeExercise(t, root, "web-incident")
-	if err := os.MkdirAll(filepath.Join(root, "skills", "authoring"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("# Catalog\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	items, err := NewLocalSource(root).List(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(items) != 1 || items[0].Exercise.Name != "web-incident" {
-		t.Fatalf("unexpected exercises: %+v", items)
-	}
-	if items[0].Description != "Web incident" || len(items[0].Tips) != 1 {
-		t.Fatalf("description or tips were not loaded: %+v", items[0])
-	}
-}
-
-func TestGitSourceLoadsCatalogFromLocalRepository(t *testing.T) {
+func TestGitSourceLoadsCatalogFromConfiguredRepository(t *testing.T) {
 	repository := t.TempDir()
 	writeExercise(t, filepath.Join(repository, "exersice"), "git-incident")
 	runTestGit(t, repository, "init", "-b", "main")

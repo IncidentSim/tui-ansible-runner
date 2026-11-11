@@ -1,43 +1,52 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"incidentctl/internal/exercises"
 	"incidentctl/internal/vm"
 )
 
-func TestBuildExerciseSourceSelectsLocal(t *testing.T) {
+func TestBuildRuntimeUsesUnifiedConfiguration(t *testing.T) {
 	t.Parallel()
-	source, err := buildExerciseSource("local", t.TempDir(), "unused.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := source.(*exercises.LocalSource); !ok {
-		t.Fatalf("unexpected source type %T", source)
-	}
-}
-
-func TestBuildConnectionProviderSelectsMicroVMStub(t *testing.T) {
-	t.Parallel()
-	path := filepath.Join(t.TempDir(), "microvm.json")
-	data := []byte(`{
-  "base_url": "https://microvm.example/api",
-  "token_env": "INCIDENTCTL_MICROVM_TOKEN",
-  "timeout_seconds": 30,
-  "remote_work_dir": "/var/tmp/incidentctl/exercises"
-}`)
+	path := filepath.Join(t.TempDir(), "incidentctl.json")
+	userIDPath := filepath.Join(t.TempDir(), "user-id")
+	data := []byte(fmt.Sprintf(`{
+  "exercise_repository": {
+    "repository": "git@example.invalid:incidents.git",
+    "ref": "master",
+    "subdirectory": ".",
+    "cache_dir": "/tmp/incidentctl-test-cache"
+  },
+  "vm_service": {
+    "base_url": "https://microvm.example/api",
+    "token_env": "INCIDENTCTL_MICROVM_TOKEN",
+    "timeout_seconds": 30,
+    "remote_work_dir": "/var/tmp/incidentctl/exercises"
+  },
+  "user_id_file": %q
+}`, userIDPath))
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	provider, workDir, err := buildConnectionProvider("microvm-service", "unused.json", path)
+	source, provider, workDir, err := buildRuntime(path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if source == nil || provider == nil {
+		t.Fatal("unified configuration did not build runtime")
+	}
 	if _, ok := provider.(*vm.MicroVMServiceProvider); !ok {
 		t.Fatalf("unexpected provider type %T", provider)
+	}
+	providerStub := provider.(*vm.MicroVMServiceProvider)
+	if providerStub.UserID() == "" {
+		t.Fatal("runtime did not load a user ID")
+	}
+	if _, err := os.Stat(userIDPath); err != nil {
+		t.Fatalf("user ID file was not created: %v", err)
 	}
 	if workDir != "/var/tmp/incidentctl/exercises" {
 		t.Fatalf("unexpected work directory %q", workDir)

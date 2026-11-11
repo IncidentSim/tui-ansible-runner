@@ -17,8 +17,6 @@ import (
 	"incidentctl/internal/vm"
 )
 
-const exerciseRoot = "exersice"
-
 type connectionInfo struct {
 	Host         string  `json:"host"`
 	IP           string  `json:"ip"`
@@ -43,12 +41,7 @@ func main() {
 func run(args []string) int {
 	flags := flag.NewFlagSet("incidentctl", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
-	configPath := flags.String("config", "incidentctl.json", "path to the direct VM configuration")
-	vmProviderName := flags.String("vm-provider", "direct", "VM provider: direct or microvm-service")
-	microVMConfigPath := flags.String("microvm-service-config", "microvm-service.json", "path to the microVM service configuration")
-	exerciseSourceName := flags.String("exercise-source", "local", "exercise source: local or git")
-	exerciseRootPath := flags.String("exercise-root", exerciseRoot, "path to the local exercise directory")
-	exerciseRepositoryConfigPath := flags.String("exercise-repository-config", "exercise-repository.json", "path to the Git exercise source configuration")
+	configPath := flags.String("config", "incidentctl.json", "path to the unified incidentctl configuration")
 	flags.Usage = usage
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -62,11 +55,7 @@ func run(args []string) int {
 		return 0
 	}
 
-	source, err := buildExerciseSource(*exerciseSourceName, *exerciseRootPath, *exerciseRepositoryConfigPath)
-	if err != nil {
-		return fail(err)
-	}
-	provider, remoteWorkDir, providerErr := buildConnectionProvider(*vmProviderName, *configPath, *microVMConfigPath)
+	source, provider, remoteWorkDir, providerErr := buildRuntime(*configPath)
 	if len(rest) == 0 || rest[0] == "tui" {
 		if len(rest) > 1 {
 			return fail(errors.New("tui does not accept arguments"))
@@ -82,6 +71,7 @@ func run(args []string) int {
 	ctx := context.Background()
 	command := rest[0]
 	commandArgs := rest[1:]
+	var err error
 
 	switch command {
 	case "ssh-check":
@@ -136,25 +126,20 @@ func run(args []string) int {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `incidentctl — запуск incident exercises на готовой Linux VM
+	fmt.Fprintln(os.Stderr, `incidentctl — запуск incident exercises через VM service API
 
 Usage:
-  incidentctl [provider flags] [tui]
-  incidentctl [provider flags] ssh-check
-  incidentctl [provider flags] connection
-  incidentctl [provider flags] infra    <exercise> [-- ansible-playbook args]
-  incidentctl [provider flags] incident <exercise> [-- ansible-playbook args]
-  incidentctl [provider flags] verify   <exercise> [-- ansible-playbook args]
+  incidentctl [config flags] [tui]
+  incidentctl [config flags] ssh-check
+  incidentctl [config flags] connection
+  incidentctl [config flags] infra    <exercise> [-- ansible-playbook args]
+  incidentctl [config flags] incident <exercise> [-- ansible-playbook args]
+  incidentctl [config flags] verify   <exercise> [-- ansible-playbook args]
 
-Provider flags:
-  -vm-provider direct|microvm-service
+Configuration flags:
   -config incidentctl.json
-  -microvm-service-config microvm-service.json
-  -exercise-source local|git
-  -exercise-root exersice
-  -exercise-repository-config exercise-repository.json
 
-Exercise definition: exersice/<exercise>/vm.json`)
+Exercise definition: configured remote Git repository/<exercise>/vm.json`)
 }
 
 func fail(err error) int {

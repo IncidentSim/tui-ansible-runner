@@ -1,25 +1,25 @@
 # incidentctl
 
-`incidentctl` запускает учебные incident exercises на заранее подготовленной Linux VM. CLI работает на локальной машине, загружает выбранный каталог из `exersice/` по SSH и выполняет Ansible на самой VM с inventory `localhost`.
+`incidentctl` получает каталог incident exercises из настроенного удалённого
+Git-репозитория и обращается к VM service API. Локальный каталог заданий и
+подключение к локальной VM больше не являются вариантами запуска.
 
-Firecracker, KVM, TAP-интерфейсы и вложенные гостевые VM не используются.
+Сейчас API-провайдер оставлен заглушкой: список заданий можно получить из
+удалённого репозитория, но операции `infra`, `incident`, `verify`, `connection`
+и `ssh-check` завершатся ошибкой `microVM service provider is not implemented`,
+пока API-клиент не будет реализован.
 
 ## Требования
 
 Локально:
 
 - Go 1.26;
-- OpenSSH client;
-- SSH-ключ для целевой VM;
-- Git, если выбран удалённый источник заданий.
+- Git;
+- доступ к настроенному удалённому Git-репозиторию;
+- конфигурация VM service API.
 
-На VM:
-
-- Linux и доступ по SSH;
-- `bash`, `python3`, `tar`, `ansible-playbook`;
-- пользователь, имеющий права, необходимые playbook'ам. Текущая конфигурация использует `root`.
-
-Требования конкретного упражнения, включая зафиксированные версии пакетов, описаны в его `vm.json`.
+Требования конкретного упражнения, включая ресурсы VM и версии пакетов,
+описаны в его `vm.json` и передаются будущему API-провайдеру.
 
 ## Настройка
 
@@ -28,54 +28,58 @@ cp incidentctl.example.json incidentctl.json
 go build -o bin/incidentctl ./cmd/incidentctl
 ```
 
-`incidentctl.json` содержит локальный путь к SSH-ключу и не попадает в Git.
-
-По умолчанию используются существующая VM и локальный каталог заданий:
+Те же действия доступны через `Makefile`:
 
 ```bash
-bin/incidentctl \
-  -vm-provider direct \
-  -exercise-source local
+make config   # создать incidentctl.json, если его ещё нет
+make build    # собрать bin/incidentctl
+make run      # собрать и запустить TUI
+make test
+make check    # форматирование, тесты, vet и сборка
 ```
 
-Доступны два провайдера подключения к VM:
-
-- `direct` читает SSH-реквизиты из `incidentctl.json` и сохраняет прежнее поведение;
-- `microvm-service` предназначен для удалённого сервиса создания microVM. Сейчас это явная заглушка, возвращающая ошибку `microVM service provider is not implemented`.
-
-Конфигурация будущего сервиса создаётся отдельно:
+Дополнительные аргументы CLI можно передать через `ARGS`, например:
 
 ```bash
-cp microvm-service.example.json microvm-service.json
-bin/incidentctl \
-  -vm-provider microvm-service \
-  -microvm-service-config microvm-service.json
+make run ARGS='infra nginx-wrong-api'
 ```
 
-Токен не записывается в JSON: `token_env` содержит имя переменной окружения, из которой реализация сервиса сможет получить токен.
+`incidentctl.json` объединяет настройки удалённого Git-репозитория и VM service
+API. Секция `exercise_repository` задаёт repository, ref, каталог с
+упражнениями и локальный кеш checkout. Кеш нужен только как техническое место
+для чтения уже загруженного удалённого репозитория; источником задач остаётся
+только настроенный remote.
 
-### Источник заданий
-
-Локальный источник читает задания из Git-submodule `exersice/`. После клонирования основного проекта инициализируйте его:
+При первом обычном запуске создаётся случайный UUID пользователя устройства и
+сохраняется в системном каталоге конфигурации ОС:
+`<user-config-dir>/incidentctl/user-id`. Файл имеет права `0600`, а один и тот
+же ID используется при последующих запусках. Путь можно переопределить полем
+`user_id_file` в `incidentctl.json`; этот ID будет передаваться будущему API
+как `user_id`.
 
 ```bash
-git submodule update --init --recursive
+bin/incidentctl -config incidentctl.json
 ```
 
-Другая директория задаётся через `-exercise-root`.
-
-Удалённый источник работает с обычным Git-репозиторием и не привязан к GitHub API. При запуске он получает указанный `ref` в отдельный каталог кеша, после чего использует тот же файловый загрузчик:
+Флаг имеет это значение по умолчанию, поэтому обычно достаточно:
 
 ```bash
-cp exercise-repository.example.json exercise-repository.json
-bin/incidentctl \
-  -exercise-source git \
-  -exercise-repository-config exercise-repository.json
+bin/incidentctl
 ```
 
-Шаблон уже настроен на `git@github.com:IncidentSim/exersice.git`, ветку `master` и корень репозитория. Формат репозитория описан в `exersice/README.md`.
+В секции `vm_service` токен не хранится: поле `token_env` содержит имя
+переменной окружения, из которой будущая реализация сможет получить токен.
 
-Чтобы отредактировать и опубликовать задания из этого checkout:
+### Репозиторий упражнений
+
+Удалённый источник работает с обычным Git-репозиторием и не привязан к GitHub
+API. При запуске он получает указанный `ref` в каталог кеша, затем читает
+упражнения из `subdirectory`.
+
+Шаблон уже настроен на `git@github.com:IncidentSim/exersice.git`, ветку `master`
+и корень репозитория. Формат репозитория описан в `exersice/README.md`.
+
+Чтобы опубликовать изменения каталога из отдельного checkout:
 
 ```bash
 cd exersice
@@ -86,135 +90,60 @@ git add .
 git commit -m "Describe exercise update"
 git push origin master
 cd ..
-git add exersice
 ```
 
-Последняя команда обновляет gitlink основного проекта на новый commit подмодуля.
+### API VM service
 
-### Подготовка Ubuntu VM
+Провайдер выбирается автоматически и всегда является `microvm-service`. Его
+настройки находятся в секции `vm_service` единого `incidentctl.json`:
 
-Проект проверен на Ubuntu 24.04.5 LTS. На чистой VM до первого запуска `incidentctl` должны быть установлены:
-
-| Пакет | Проверенная версия | Назначение |
-|---|---|---|
-| `ansible-core` | `2.16.3-0ubuntu2` | Запуск playbook'ов на VM |
-| `python3` | `3.12.3-0ubuntu2.1` | Runtime Ansible и служебных модулей |
-| `python3-apt` | `2.7.7ubuntu5.3` | Работа Ansible с APT |
-| `tar` | `1.35+dfsg-3ubuntu0.4` | Распаковка загруженного упражнения |
-| `ca-certificates` | `20260816ubuntu0.24.04.2` | Проверка TLS-сертификатов при загрузке пакетов и образов |
-
-Установить полный bootstrap-набор можно так:
-
-```bash
-apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  ansible-core=2.16.3-0ubuntu2 \
-  python3=3.12.3-0ubuntu2.1 \
-  python3-apt=2.7.7ubuntu5.3 \
-  tar=1.35+dfsg-3ubuntu0.4 \
-  ca-certificates=20260816ubuntu0.24.04.2
+```json
+"vm_service": {
+  "base_url": "https://microvm.example/api",
+  "token_env": "INCIDENTCTL_MICROVM_TOKEN",
+  "timeout_seconds": 30,
+  "remote_work_dir": "/var/tmp/incidentctl/exercises"
+}
 ```
 
-Для обычной Ubuntu VM, где SSH не предоставляется гипервизором, дополнительно установите и запустите SSH-сервер:
-
-```bash
-DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server
-systemctl enable --now ssh
-```
-
-Также требуется пользователь с доступом по SSH и правами на изменение системной конфигурации. Текущий пример подключается как `root`; при использовании непривилегированного пользователя playbook'ам потребуется настроенный `sudo`.
-
-Текущая OrbStack VM настраивается так:
-
-```bash
-ssh root@incidentsim.orb.local -i ~/.orbstack/ssh/id_ed25519
-apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y ansible-core=2.16.3-0ubuntu2
-```
-
-Docker, Nginx и приложения устанавливаются infra-playbook'ом, а не вручную.
-
-Зафиксированные версии относятся к настроенным Ubuntu-репозиториям на момент проверки. Если репозиторий уже не содержит конкретную версию, сначала определите новый candidate через `apt-cache policy <package>`, затем синхронно обновите `vm.json`, infra-playbook и эту таблицу.
+HTTP-вызовы API пока не выполняются — провайдер намеренно возвращает явную
+ошибку-заглушку. Это оставляет единый контракт для будущего создания VM через
+сервис и исключает локальное развёртывание.
 
 ## Команды
 
 ```bash
-# Открыть интерактивный TUI (режим по умолчанию)
+# Открыть TUI; список загружается из удалённого Git-репозитория
 bin/incidentctl
 
-# Проверить SSH и базовое окружение VM
-bin/incidentctl ssh-check
-
-# Получить hostname, IP, порт и реквизиты входа
-bin/incidentctl connection
-
-# Развернуть или восстановить исправную инфраструктуру
+# Будущие операции через API
 bin/incidentctl infra nginx-wrong-api
-
-# Внести поломку
 bin/incidentctl incident nginx-wrong-api
-
-# Проверить пользовательский сценарий; ненулевой код означает провал проверки
 bin/incidentctl verify nginx-wrong-api
 ```
 
-Все команды принимают одинаковые флаги выбора провайдеров:
+Доступные флаги:
 
 ```text
--vm-provider direct|microvm-service
 -config incidentctl.json
--microvm-service-config microvm-service.json
--exercise-source local|git
--exercise-root exersice
--exercise-repository-config exercise-repository.json
 ```
 
-## Интерактивный режим
-
-TUI показывает список упражнений, их описания и подсказки. При запуске решения
-он последовательно выполняет `infra`, `incident` и `verify`. Задача считается
-готовой только когда проверка после внесения инцидента завершается с ненулевым
-кодом. Если verification неожиданно проходит или SSH/загрузка завершаются
-ошибкой, запуск решения останавливается.
-
-На экране активного решения доступны:
-
-- просмотр описания и подсказок;
-- показ готовой SSH-команды;
-- открытие SSH-сессии в отдельном окне Terminal (macOS), поддерживаемого
-  эмулятора терминала (Linux) или `cmd` (Windows);
-- запуск verification для проверки исправления;
-- выход к списку задач без изменения текущего состояния VM.
-
-Управление всегда показано в нижней строке текущего экрана. Для аварийного
-выхода используйте `Ctrl+C`.
-
-Дополнительные аргументы после `--` передаются `ansible-playbook`:
-
-```bash
-bin/incidentctl infra nginx-wrong-api -- --check --diff
-```
+Аргументы после `--` сохраняются для будущей передачи удалённому исполнителю
+playbook'ов.
 
 ## Структура упражнения
 
 ```text
-exersice/<name>/
+<remote-repository>/<name>/
 ├── README.md
 ├── vm.json
 ├── apps/
 ├── infra/
-│   ├── playbook.yml
-│   └── monitoring/
 ├── incident/
-│   └── playbook.yml
 ├── verification/
-│   └── playbook.yml
 └── tips/
 ```
 
-- `infra` идемпотентно создаёт исправное состояние.
-- `incident` вносит только целевую неисправность.
-- `verification` проверяет наблюдаемое поведение и завершается с ошибкой при активном инциденте.
-- повторный запуск `infra` восстанавливает исправное состояние.
-
-Написание `exersice` сохранено как существующий контракт проекта.
+`infra` создаёт исправное состояние, `incident` вносит целевую неисправность,
+а `verification` проверяет наблюдаемое поведение. Написание `exersice`
+сохранено как существующий контракт проекта.

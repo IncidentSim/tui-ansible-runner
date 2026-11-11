@@ -1,8 +1,5 @@
-# Contains workstation-specific SSH settings.
+# Contains the local unified configuration.
 incidentctl.json
-microvm.json
-microvm-service.json
-exercise-repository.json
 
 # Local build output.
 /bin/

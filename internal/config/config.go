@@ -16,20 +16,9 @@ var safeName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$`)
 var safeEnvironmentName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 type Config struct {
-	Target TargetConfig `json:"target"`
-	Paths  PathsConfig  `json:"paths"`
-}
-
-type TargetConfig struct {
-	Host                  string `json:"host"`
-	Port                  int    `json:"port"`
-	User                  string `json:"user"`
-	IdentityFile          string `json:"identity_file"`
-	StrictHostKeyChecking bool   `json:"strict_host_key_checking"`
-}
-
-type PathsConfig struct {
-	RemoteWorkDir string `json:"remote_work_dir"`
+	ExerciseRepository ExerciseRepositoryConfig `json:"exercise_repository"`
+	VMService          MicroVMServiceConfig     `json:"vm_service"`
+	UserIDFile         string                   `json:"user_id_file,omitempty"`
 }
 
 type MicroVMServiceConfig struct {
@@ -86,51 +75,30 @@ func Load(path string) (Config, error) {
 	if err := decode(path, &cfg); err != nil {
 		return cfg, err
 	}
-	if cfg.Target.Port == 0 {
-		cfg.Target.Port = 22
+	if cfg.VMService.TimeoutSeconds == 0 {
+		cfg.VMService.TimeoutSeconds = 30
 	}
-	if cfg.Paths.RemoteWorkDir == "" {
-		cfg.Paths.RemoteWorkDir = "/var/tmp/incidentctl/exercises"
+	if cfg.VMService.RemoteWorkDir == "" {
+		cfg.VMService.RemoteWorkDir = "/var/tmp/incidentctl/exercises"
 	}
-	identityFile, err := expandHome(cfg.Target.IdentityFile)
+	if cfg.ExerciseRepository.Ref == "" {
+		cfg.ExerciseRepository.Ref = "main"
+	}
+	if cfg.ExerciseRepository.Subdirectory == "" {
+		cfg.ExerciseRepository.Subdirectory = "exersice"
+	}
+	cacheDir, err := expandHome(cfg.ExerciseRepository.CacheDir)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.Target.IdentityFile = identityFile
-	return cfg, cfg.Validate()
-}
-
-func LoadMicroVMService(path string) (MicroVMServiceConfig, error) {
-	var cfg MicroVMServiceConfig
-	if err := decode(path, &cfg); err != nil {
-		return cfg, err
+	cfg.ExerciseRepository.CacheDir = cacheDir
+	if err := cfg.VMService.Validate(); err != nil {
+		return cfg, fmt.Errorf("vm_service: %w", err)
 	}
-	if cfg.TimeoutSeconds == 0 {
-		cfg.TimeoutSeconds = 30
+	if err := cfg.ExerciseRepository.Validate(); err != nil {
+		return cfg, fmt.Errorf("exercise_repository: %w", err)
 	}
-	if cfg.RemoteWorkDir == "" {
-		cfg.RemoteWorkDir = "/var/tmp/incidentctl/exercises"
-	}
-	return cfg, cfg.Validate()
-}
-
-func LoadExerciseRepository(path string) (ExerciseRepositoryConfig, error) {
-	var cfg ExerciseRepositoryConfig
-	if err := decode(path, &cfg); err != nil {
-		return cfg, err
-	}
-	if cfg.Ref == "" {
-		cfg.Ref = "main"
-	}
-	if cfg.Subdirectory == "" {
-		cfg.Subdirectory = "exersice"
-	}
-	cacheDir, err := expandHome(cfg.CacheDir)
-	if err != nil {
-		return cfg, err
-	}
-	cfg.CacheDir = cacheDir
-	return cfg, cfg.Validate()
+	return cfg, nil
 }
 
 func LoadExercise(root, name string) (Exercise, string, error) {
@@ -149,46 +117,6 @@ func LoadExercise(root, name string) (Exercise, string, error) {
 		return exercise, dir, err
 	}
 	return exercise, dir, nil
-}
-
-func (c Config) Validate() error {
-	missing := make([]string, 0, 4)
-	for key, value := range map[string]string{
-		"target.host":           c.Target.Host,
-		"target.user":           c.Target.User,
-		"target.identity_file":  c.Target.IdentityFile,
-		"paths.remote_work_dir": c.Paths.RemoteWorkDir,
-	} {
-		if strings.TrimSpace(value) == "" {
-			missing = append(missing, key)
-		}
-		if strings.ContainsAny(value, "\r\n") {
-			return fmt.Errorf("%s must not contain line breaks", key)
-		}
-	}
-	if len(missing) > 0 {
-		return fmt.Errorf("missing required configuration: %s", strings.Join(missing, ", "))
-	}
-	if c.Target.Port < 1 || c.Target.Port > 65535 {
-		return errors.New("target.port must be between 1 and 65535")
-	}
-	if !SafeName(c.Target.User) {
-		return errors.New("target.user contains unsupported characters")
-	}
-	if !safeAbsolutePath(c.Target.IdentityFile) {
-		return errors.New("target.identity_file must be an absolute path other than /")
-	}
-	info, err := os.Stat(c.Target.IdentityFile)
-	if err != nil {
-		return fmt.Errorf("target.identity_file: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return errors.New("target.identity_file must be a regular file")
-	}
-	if !safeAbsolutePath(c.Paths.RemoteWorkDir) {
-		return errors.New("paths.remote_work_dir must be an absolute path other than /")
-	}
-	return nil
 }
 
 func (c MicroVMServiceConfig) Validate() error {
