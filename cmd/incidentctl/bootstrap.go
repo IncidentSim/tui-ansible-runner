@@ -15,6 +15,10 @@ func buildRuntime(configPath string) (exercises.Source, vm.ConnectionProvider, s
 	if err != nil {
 		return nil, nil, "", "", err
 	}
+	return buildRuntimeConfig(cfg)
+}
+
+func buildRuntimeConfig(cfg config.Config) (exercises.Source, vm.ConnectionProvider, string, string, error) {
 	userID, err := identity.LoadOrCreate(cfg.UserIDFile)
 	if err != nil {
 		return nil, nil, "", "", fmt.Errorf("load user ID: %w", err)

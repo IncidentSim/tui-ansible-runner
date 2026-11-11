@@ -2,7 +2,10 @@ package remote
 
 import (
 	"errors"
+	"strings"
 	"testing"
+
+	"incidentctl/internal/vm"
 )
 
 func TestShellQuote(t *testing.T) {
@@ -22,5 +25,18 @@ func TestIsCommandError(t *testing.T) {
 	}
 	if !IsCommandError(&CommandError{ExitCode: 2}) {
 		t.Fatal("expected command error to be recognized")
+	}
+}
+
+func TestSSHRetriesConnectionsWithoutRepeatingRemoteCommand(t *testing.T) {
+	cmd := New(vm.Connection{Host: "vm.example", User: "root", Port: 22000}).command("run-once")
+	args := strings.Join(cmd.Args, " ")
+	for _, option := range []string{"ConnectTimeout=10", "ConnectionAttempts=3", "ServerAliveInterval=15", "ServerAliveCountMax=2"} {
+		if !strings.Contains(args, option) {
+			t.Fatalf("missing %s: %s", option, args)
+		}
+	}
+	if cmd.Args[len(cmd.Args)-1] != "run-once" {
+		t.Fatal("remote command changed")
 	}
 }

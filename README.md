@@ -1,5 +1,11 @@
 # incidentctl
 
+Запись действий пользователя и анализ LLM подключены к CLI/TUI.
+Пошаговый запуск: [интеграция audit-agent](docs/audit-integration.md).
+LLM-анализ запускается после успешной Ansible-проверки. Каталог отчётов задаётся
+в `audit.llm_reports_dir`; путь включает задачу и номер решения:
+`llm-reports/nginx-wrong-api/1/analysis.md`.
+
 `incidentctl` получает каталог incident exercises из настроенного удалённого
 Git-репозитория и обращается к VM service API. Локальный каталог заданий и
 подключение к локальной VM больше не являются вариантами запуска.
@@ -11,8 +17,9 @@ TUI использует VM service API: при запуске проверяе�
 загружает exercise, запускает playbooks `infra` и `incident`, а затем выполняет
 скрытую автоматическую verification-проверку ожидаемой ошибки. Только после
 успешного подтверждения открывается веб-терминал.
-SSH-код и проверка результата сохранены для совместимости, но их кнопки убраны
-из TUI.
+После подтверждения инцидента включается запись audit-agent, затем открывается
+терминал. На экране решения `v` останавливает запись и проверяет решение,
+после проверки запись автоматически включается снова.
 
 ## Требования
 
@@ -42,6 +49,12 @@ make run      # собрать и запустить TUI
 make test
 make check    # форматирование, тесты, vet и сборка
 ```
+
+Для постмортема LLM укажите в `incidentctl.json` `audit.llm.enabled: true`
+и DeepSeek-ключ в `audit.llm.api_key` либо переменной `DEEPSEEK_API_KEY`.
+Исходники audit-agent автоматически скачиваются из `audit.repository`
+в локальный Git-кеш; соседний checkout и отдельный LLM-конфиг не нужны.
+После настройки достаточно `make run`.
 
 Дополнительные аргументы CLI можно передать через `ARGS`, например:
 
@@ -138,9 +151,9 @@ cd ..
 bin/incidentctl
 
 # Legacy SSH-команды остаются доступны вне TUI
-bin/incidentctl infra nginx-wrong-api
-bin/incidentctl incident nginx-wrong-api
-bin/incidentctl verify nginx-wrong-api
+bin/incidentctl -vm-id VM_ID infra nginx-wrong-api
+bin/incidentctl -vm-id VM_ID incident nginx-wrong-api
+bin/incidentctl -vm-id VM_ID verify nginx-wrong-api
 ```
 
 Доступные флаги:

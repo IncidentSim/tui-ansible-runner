@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"incidentctl/internal/auditrepo"
 	"incidentctl/internal/config"
 	"incidentctl/internal/remote"
 	"incidentctl/internal/vm"
@@ -42,6 +43,12 @@ func run(args []string) int {
 	flags := flag.NewFlagSet("incidentctl", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	configPath := flags.String("config", "incidentctl.json", "path to the unified incidentctl configuration")
+	vmID := flags.String("vm-id", "", "existing VM ID for non-interactive commands")
+	audit := defaultAuditOptions()
+	flags.StringVar(&audit.AgentDir, "audit-agent-dir", "", "optional local audit-agent override; otherwise download configured Git repository")
+	flags.StringVar(&audit.Python, "audit-python", audit.Python, "local Python interpreter for LLM analysis")
+	flags.StringVar(&audit.LLMConfig, "audit-llm-config", "", "local LLM configuration; empty saves logs without analysis")
+	flags.StringVar(&audit.ReportsDir, "audit-reports-dir", audit.ReportsDir, "local audit reports directory")
 	flags.Usage = usage
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -55,7 +62,23 @@ func run(args []string) int {
 		return 0
 	}
 
-	source, provider, remoteWorkDir, tokenFile, providerErr := buildRuntime(*configPath)
+	cfg, configErr := config.Load(*configPath)
+	if configErr != nil {
+		return fail(configErr)
+	}
+	audit.LLMReportsDir = cfg.Audit.LLMReportsDir
+	audit.Source = &auditrepo.Source{Config: *cfg.Audit.Repository}
+	llmConfigFlagSet := false
+	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "audit-llm-config" {
+			llmConfigFlagSet = true
+		}
+	})
+	if !llmConfigFlagSet {
+		audit.LLMConfig = cfg.Audit.LLMConfig
+		audit.LLM = cfg.Audit.LLM
+	}
+	source, provider, remoteWorkDir, tokenFile, providerErr := buildRuntimeConfig(cfg)
 	if len(rest) == 0 || rest[0] == "tui" {
 		if providerErr != nil {
 			return fail(providerErr)
@@ -63,7 +86,7 @@ func run(args []string) int {
 		if len(rest) > 1 {
 			return fail(errors.New("tui does not accept arguments"))
 		}
-		if err := runTUI(source, provider, remoteWorkDir, tokenFile); err != nil {
+		if err := runTUI(source, provider, remoteWorkDir, tokenFile, audit); err != nil {
 			return fail(err)
 		}
 		return 0
@@ -75,29 +98,40 @@ func run(args []string) int {
 	command := rest[0]
 	commandArgs := rest[1:]
 	var err error
+	var commandConnection vm.Connection
+	switch command {
+	case "ssh-check", "connection", "infra", "incident", "verify", "record":
+		if *vmID == "" {
+			return fail(errors.New("non-interactive commands require -vm-id <existing VM ID>; create a VM in the TUI first"))
+		}
+		apiProvider, ok := provider.(vm.APIProvider)
+		if !ok {
+			return fail(errors.New("VM provider does not support SSH metadata"))
+		}
+		var cleanup func()
+		commandConnection, cleanup, err = apiProvider.SSHConnection(ctx, *vmID)
+		if err != nil {
+			return fail(err)
+		}
+		if cleanup != nil {
+			defer cleanup()
+		}
+	}
 
 	switch command {
 	case "ssh-check":
 		if len(commandArgs) != 0 {
 			return fail(errors.New("ssh-check does not accept arguments"))
 		}
-		connection, connectionErr := provider.Connection(ctx, nil)
-		if connectionErr != nil {
-			err = connectionErr
-			break
-		}
+		connection := commandConnection
 		err = sshCheck(remote.New(connection), remoteWorkDir)
 	case "connection":
 		if len(commandArgs) != 0 {
 			return fail(errors.New("connection does not accept arguments"))
 		}
-		connection, connectionErr := provider.Connection(ctx, nil)
-		if connectionErr != nil {
-			err = connectionErr
-			break
-		}
+		connection := commandConnection
 		err = printConnection(remote.New(connection), connection)
-	case "infra", "incident", "verify":
+	case "infra", "incident", "verify", "record":
 		if len(commandArgs) == 0 {
 			return fail(fmt.Errorf("%s requires an exercise name", command))
 		}
@@ -105,19 +139,35 @@ func run(args []string) int {
 		if loadErr != nil {
 			return fail(loadErr)
 		}
-		connection, connectionErr := provider.Connection(ctx, vm.RequestFromExercise(item.Exercise))
-		if connectionErr != nil {
-			return fail(connectionErr)
-		}
+		connection := commandConnection
 		extra := commandArgs[1:]
 		if len(extra) > 0 && extra[0] == "--" {
 			extra = extra[1:]
+		}
+		if command == "record" {
+			if len(extra) != 0 {
+				return fail(errors.New("record does not accept Ansible arguments"))
+			}
+			err = audit.start(remote.New(connection), remoteWorkDir, item.Exercise.Name)
+			break
 		}
 		playbook, selectErr := selectPlaybook(item.Exercise, command)
 		if selectErr != nil {
 			return fail(selectErr)
 		}
-		err = runPlaybook(remote.New(connection), remoteWorkDir, item.Exercise, item.Dir, playbook, extra)
+		client := remote.New(connection)
+		if command == "verify" {
+			err = audit.verify(client, remoteWorkDir, item.Exercise.Name, item.Dir, os.Stdout, func(out io.Writer) error {
+				return runPlaybook(remote.NewWithWriters(connection, out, out), remoteWorkDir, item.Exercise, item.Dir, playbook, extra)
+			})
+		} else if err = audit.prepare(client, remoteWorkDir, item.Exercise.Name); err == nil {
+			if err = preparePlaybookHost(client, item.Exercise); err == nil {
+				err = runPlaybook(client, remoteWorkDir, item.Exercise, item.Dir, playbook, extra)
+				if err == nil {
+					err = audit.start(client, remoteWorkDir, item.Exercise.Name)
+				}
+			}
+		}
 	default:
 		usage()
 		return fail(fmt.Errorf("unknown command %q", command))
@@ -138,9 +188,15 @@ Usage:
   incidentctl [config flags] infra    <exercise> [-- ansible-playbook args]
   incidentctl [config flags] incident <exercise> [-- ansible-playbook args]
   incidentctl [config flags] verify   <exercise> [-- ansible-playbook args]
+  incidentctl [config flags] record   <exercise>
 
 Configuration flags:
   -config incidentctl.json
+  -vm-id <existing VM ID> (required outside TUI)
+  -audit-agent-dir /optional/local/audit-agent (otherwise Git download)
+  -audit-python python3 (python on Windows)
+  -audit-llm-config /path/to/llm.local.json
+  -audit-reports-dir analysis
 
 Exercise definition: configured remote Git repository/<exercise>/vm.json`)
 }

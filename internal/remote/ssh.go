@@ -89,6 +89,9 @@ func (c *Client) command(remoteCommand string) *exec.Cmd {
 		"-p", strconv.Itoa(c.config.Port),
 		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout=10",
+		"-o", "ConnectionAttempts=3",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=2",
 	}
 	if c.config.IdentityFile != "" {
 		args = append(args, "-i", c.config.IdentityFile)
