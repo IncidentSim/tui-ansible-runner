@@ -111,7 +111,6 @@ cd ..
 ```json
 "vm_service": {
   "base_url": "https://petruekhin.tech:19453",
-  "token_env": "INCIDENTCTL_MICROVM_TOKEN",
   "timeout_seconds": 30,
   "remote_work_dir": "/var/tmp/incidentctl/exercises",
   "image_id": "ubuntu-base",
@@ -119,11 +118,13 @@ cd ..
 }
 ```
 
-Из OpenAPI сервиса используются `GET /v1/capabilities`, `POST /v1/vms`,
-`GET /v1/operations/{id}`, `POST /v1/vms/{id}/terminal`,
+Из OpenAPI сервиса используются `GET /v1/capabilities`, `GET /v1/vms`,
+`POST /v1/vms`, `DELETE /v1/vms/{id}`, `GET /v1/operations/{id}`,
+`POST /v1/vms/{id}/terminal`,
 `GET /v1/vms/{id}/ssh` и `GET /v1/vms/{id}/ssh-key`. Мутации возвращают
-операцию, поэтому клиент дожидается статуса `succeeded`; SSH-метаданные
-опрашиваются до `ready=true`. При HTTP 401 TUI
+операции, поэтому клиент дожидается статуса `succeeded`; при выходе из TUI
+клавишей `q` все VM пользователя сначала запрашиваются, затем удаляются.
+SSH-метаданные опрашиваются до `ready=true`. При HTTP 401 TUI
 сообщает, что токен просрочен, а ошибка создания VM показывается как:
 «сейчас сервер занят, попробуйте подключиться позже».
 

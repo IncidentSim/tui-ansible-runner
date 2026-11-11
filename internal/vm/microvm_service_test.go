@@ -118,6 +118,39 @@ func TestMicroVMServiceProviderReportsUnauthorizedToken(t *testing.T) {
 	}
 }
 
+func TestMicroVMServiceProviderCleansUpAllVMs(t *testing.T) {
+	var deleted []string
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/vms":
+			return jsonResponse(http.StatusOK, `{"vms":[{"id":"vm-1"},{"id":"vm-2"}]}`), nil
+		case request.Method == http.MethodDelete && strings.HasPrefix(request.URL.Path, "/v1/vms/"):
+			if request.Header.Get("Idempotency-Key") == "" {
+				t.Error("delete VM request has no idempotency key")
+			}
+			id := strings.TrimPrefix(request.URL.Path, "/v1/vms/")
+			deleted = append(deleted, id)
+			return jsonResponse(http.StatusAccepted, `{"operation_id":"delete-`+id+`"}`), nil
+		case request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/v1/operations/delete-"):
+			return jsonResponse(http.StatusOK, `{"status":"succeeded"}`), nil
+		default:
+			return jsonResponse(http.StatusNotFound, `{}`), nil
+		}
+	})
+	provider := NewMicroVMServiceProviderWithCredentials(config.MicroVMServiceConfig{
+		BaseURL:        "https://service.example",
+		TimeoutSeconds: 2,
+	}, "device-id", "valid-token")
+	provider.httpClient = &http.Client{Transport: transport}
+
+	if err := provider.CleanupAllVMs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(deleted, ",") != "vm-1,vm-2" {
+		t.Fatalf("deleted VMs = %v, want [vm-1 vm-2]", deleted)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {

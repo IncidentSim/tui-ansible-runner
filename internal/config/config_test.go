@@ -46,7 +46,6 @@ func TestMicroVMServiceConfigValidate(t *testing.T) {
 	t.Parallel()
 	valid := MicroVMServiceConfig{
 		BaseURL:        "https://microvm.example/api",
-		TokenEnv:       "INCIDENTCTL_MICROVM_TOKEN",
 		TimeoutSeconds: 30,
 		RemoteWorkDir:  "/var/tmp/incidentctl/exercises",
 	}

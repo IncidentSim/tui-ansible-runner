@@ -41,13 +41,14 @@ type Capabilities struct {
 }
 
 type VirtualMachine struct {
-	ID string
+	ID string `json:"id"`
 }
 
 type APIProvider interface {
 	ConnectionProvider
 	Capabilities(context.Context) (Capabilities, error)
 	CreateVM(context.Context, *Request) (VirtualMachine, error)
+	CleanupAllVMs(context.Context) error
 	TerminalURL(context.Context, string) (string, error)
 	SSHConnection(context.Context, string) (Connection, func(), error)
 	SetToken(string)
@@ -119,7 +120,7 @@ func (p *MicroVMServiceProvider) CreateVM(ctx context.Context, request *Request)
 		p.mu.RUnlock()
 	}
 	body := createVMRequest{ImageID: p.config.ImageID, Profile: profile, TTL: p.config.TTLSeconds}
-	var created createVMResponse
+	var created operationAcceptedResponse
 	if err := p.doJSON(ctx, http.MethodPost, "/v1/vms", body, &created, newIdempotencyKey()); err != nil {
 		return VirtualMachine{}, err
 	}
@@ -135,6 +136,43 @@ func (p *MicroVMServiceProvider) CreateVM(ctx context.Context, request *Request)
 		return VirtualMachine{}, errors.New("VM service did not return vm_id")
 	}
 	return VirtualMachine{ID: vmID}, nil
+}
+
+func (p *MicroVMServiceProvider) CleanupAllVMs(ctx context.Context) error {
+	if p.currentToken() == "" {
+		return ErrTokenRequired
+	}
+	var listed listVMResponse
+	if err := p.doJSON(ctx, http.MethodGet, "/v1/vms", nil, &listed, ""); err != nil {
+		return fmt.Errorf("list VMs: %w", err)
+	}
+
+	var cleanupErrors []error
+	for _, instance := range listed.VMs {
+		if strings.TrimSpace(instance.ID) == "" {
+			cleanupErrors = append(cleanupErrors, errors.New("list VMs returned an empty VM id"))
+			continue
+		}
+		if err := p.deleteVM(ctx, instance.ID); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("delete VM %s: %w", instance.ID, err))
+		}
+	}
+	return errors.Join(cleanupErrors...)
+}
+
+func (p *MicroVMServiceProvider) deleteVM(ctx context.Context, vmID string) error {
+	if strings.TrimSpace(vmID) == "" {
+		return errors.New("VM id is required")
+	}
+	var accepted operationAcceptedResponse
+	path := "/v1/vms/" + url.PathEscape(vmID)
+	if err := p.doJSON(ctx, http.MethodDelete, path, nil, &accepted, newIdempotencyKey()); err != nil {
+		return err
+	}
+	if _, err := p.waitOperation(ctx, accepted.OperationID); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (p *MicroVMServiceProvider) TerminalURL(ctx context.Context, vmID string) (string, error) {
@@ -243,9 +281,13 @@ type createVMRequest struct {
 	TTL     int    `json:"ttl_seconds,omitempty"`
 }
 
-type createVMResponse struct {
+type operationAcceptedResponse struct {
 	OperationID string `json:"operation_id"`
 	VMID        string `json:"vm_id"`
+}
+
+type listVMResponse struct {
+	VMs []VirtualMachine `json:"vms"`
 }
 
 type terminalResponse struct {

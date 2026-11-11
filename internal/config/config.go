@@ -13,7 +13,6 @@ import (
 )
 
 var safeName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$`)
-var safeEnvironmentName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 type Config struct {
 	ExerciseRepository ExerciseRepositoryConfig `json:"exercise_repository"`
@@ -24,7 +23,6 @@ type Config struct {
 
 type MicroVMServiceConfig struct {
 	BaseURL        string `json:"base_url"`
-	TokenEnv       string `json:"token_env"`
 	TimeoutSeconds int    `json:"timeout_seconds"`
 	RemoteWorkDir  string `json:"remote_work_dir"`
 	ImageID        string `json:"image_id"`
@@ -127,9 +125,6 @@ func (c MicroVMServiceConfig) Validate() error {
 	parsedURL, err := url.ParseRequestURI(c.BaseURL)
 	if err != nil || parsedURL.Host == "" || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
 		return errors.New("base_url must be an absolute HTTP or HTTPS URL")
-	}
-	if c.TokenEnv != "" && !safeEnvironmentName.MatchString(c.TokenEnv) {
-		return errors.New("token_env must be a valid environment variable name")
 	}
 	if c.TimeoutSeconds < 1 {
 		return errors.New("timeout_seconds must be positive")

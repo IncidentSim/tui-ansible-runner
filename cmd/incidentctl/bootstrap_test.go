@@ -23,7 +23,6 @@ func TestBuildRuntimeUsesUnifiedConfiguration(t *testing.T) {
   },
   "vm_service": {
     "base_url": "https://microvm.example/api",
-    "token_env": "INCIDENTCTL_MICROVM_TOKEN",
     "timeout_seconds": 30,
     "remote_work_dir": "/var/tmp/incidentctl/exercises"
   },

@@ -208,8 +208,17 @@ func runTUI(source exercises.Source, provider vm.ConnectionProvider, remoteWorkD
 			model.status = "Сервис виртуальных машин недоступен. Попробуйте подключиться позже."
 		}
 	}
-	_, err = tea.NewProgram(model, tea.WithAltScreen()).Run()
-	return err
+	_, runErr := tea.NewProgram(model, tea.WithAltScreen()).Run()
+	cleanupErr := cleanupVMs(context.Background(), provider)
+	return errors.Join(runErr, cleanupErr)
+}
+
+func cleanupVMs(ctx context.Context, provider vm.ConnectionProvider) error {
+	apiProvider, ok := provider.(vm.APIProvider)
+	if !ok {
+		return nil
+	}
+	return apiProvider.CleanupAllVMs(ctx)
 }
 
 func withoutFirstLine(value string) string {

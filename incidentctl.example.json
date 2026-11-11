@@ -7,7 +7,6 @@
   },
   "vm_service": {
     "base_url": "https://petruekhin.tech:19453",
-    "token_env": "INCIDENTCTL_MICROVM_TOKEN",
     "timeout_seconds": 30,
     "remote_work_dir": "/var/tmp/incidentctl/exercises",
     "image_id": "ubuntu-base",
