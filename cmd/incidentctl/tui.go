@@ -68,6 +68,37 @@ type operationResult struct {
 	err        error
 }
 
+type solutionStage int
+
+const (
+	solutionCheckCapabilities solutionStage = iota
+	solutionCreateVM
+	solutionConnectSSH
+	solutionPrepareAnsible
+	solutionApplyInfra
+	solutionApplyIncident
+	solutionVerifyIncident
+	solutionOpenTerminal
+)
+
+type solutionRun struct {
+	provider      vm.APIProvider
+	item          exerciseItem
+	remoteWorkDir string
+	instance      vm.VirtualMachine
+	connection    vm.Connection
+	cleanup       func()
+	client        *remote.Client
+	output        bytes.Buffer
+	terminalURL   string
+}
+
+type solutionStageResult struct {
+	run   *solutionRun
+	stage solutionStage
+	err   error
+}
+
 const (
 	tokenExpiredMessage = "токен просрочен, обновите токен перед решением задач"
 	serverBusyMessage   = "сейчас сервер занят, попробуйте подключиться позже"
@@ -78,6 +109,7 @@ type tuiModel struct {
 	remoteWorkDir    string
 	connection       *vm.Connection
 	sshCleanup       func()
+	solution         *solutionRun
 	exercises        []exerciseItem
 	screen           tuiScreen
 	returnTo         tuiScreen
@@ -171,6 +203,52 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := message.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		return m, nil
+	case solutionStageResult:
+		if msg.run != m.solution {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.busy = false
+			m.adoptSolutionConnection(msg.run)
+			if errors.Is(msg.err, vm.ErrTokenExpired) {
+				m.status = tokenExpiredMessage
+			} else if msg.stage == solutionCheckCapabilities || msg.stage == solutionCreateVM || msg.stage == solutionConnectSSH || msg.stage == solutionOpenTerminal {
+				m.status = serverBusyMessage
+			} else {
+				m.status = "Ошибка: " + msg.err.Error()
+			}
+			m.logs = msg.run.output.String()
+			return m, nil
+		}
+		switch msg.stage {
+		case solutionCheckCapabilities:
+			m.status = "Создаю виртуальную машину…"
+			return m, msg.run.createVMCmd()
+		case solutionCreateVM:
+			m.status = "Ожидаю готовность SSH…"
+			return m, msg.run.connectSSHCmd()
+		case solutionConnectSSH:
+			m.status = "Устанавливаю всё необходимое для Ansible…"
+			return m, msg.run.prepareAnsibleCmd()
+		case solutionPrepareAnsible:
+			m.status = "Применяю инфраструктурный playbook…"
+			return m, msg.run.applyInfraCmd()
+		case solutionApplyInfra:
+			m.status = "Применяю incident playbook…"
+			return m, msg.run.applyIncidentCmd()
+		case solutionApplyIncident:
+			m.status = "Проверяю, что инцидент воспроизведён…"
+			return m, msg.run.verifyIncidentCmd()
+		case solutionVerifyIncident:
+			m.status = "Инфраструктура подготовлена. Открываю веб-терминал…"
+			return m, msg.run.openTerminalCmd()
+		case solutionOpenTerminal:
+			m.busy = false
+			m.logs = msg.run.output.String()
+			m.adoptSolutionConnection(msg.run)
+			m.status = "Задача готова: инфраструктура и инцидент применены, веб-терминал открыт."
+		}
 		return m, nil
 	case operationResult:
 		m.busy = false
@@ -372,72 +450,109 @@ func (m tuiModel) startSolution() (tea.Model, tea.Cmd) {
 		m.status = "Провайдер VM не поддерживает API создания виртуальной машины"
 		return m, nil
 	}
-	m.screen, m.busy, m.status, m.logs = screenSolution, true, "Проверяю токен и создаю виртуальную машину…", ""
-	remoteWorkDir := m.remoteWorkDir
-	return m, func() tea.Msg {
-		ctx := context.Background()
-		if _, err := apiProvider.Capabilities(ctx); err != nil {
-			if errors.Is(err, vm.ErrTokenExpired) {
-				return operationResult{kind: operationStart, status: tokenExpiredMessage}
-			}
-			return operationResult{kind: operationStart, status: serverBusyMessage}
-		}
-		instance, err := apiProvider.CreateVM(ctx, vm.RequestFromExercise(item.exercise))
-		if err != nil {
-			if errors.Is(err, vm.ErrTokenExpired) {
-				return operationResult{kind: operationStart, status: tokenExpiredMessage}
-			}
-			return operationResult{kind: operationStart, status: serverBusyMessage}
-		}
-		terminalURL, err := apiProvider.TerminalURL(ctx, instance.ID)
-		if err != nil {
-			if errors.Is(err, vm.ErrTokenExpired) {
-				return operationResult{kind: operationStart, status: tokenExpiredMessage}
-			}
-			return operationResult{kind: operationStart, status: serverBusyMessage}
-		}
-		if err := openBrowserURL(terminalURL); err != nil {
-			return operationResult{
-				kind:   operationStart,
-				output: "Веб-терминал: " + terminalURL,
-				err:    fmt.Errorf("не удалось открыть веб-терминал: %w", err),
-			}
-		}
-
-		connection, cleanup, err := apiProvider.SSHConnection(ctx, instance.ID)
-		if err != nil {
-			if errors.Is(err, vm.ErrTokenExpired) {
-				return operationResult{kind: operationStart, status: tokenExpiredMessage}
-			}
-			return operationResult{kind: operationStart, status: serverBusyMessage}
-		}
-		var output bytes.Buffer
-		client := remote.NewWithWriters(connection, &output, &output)
-		fmt.Fprintln(&output, "\n━━ Подготовка Ansible ━━")
-		if err := preparePlaybookHost(client, item.exercise); err != nil {
-			return operationResult{
-				kind:       operationStart,
-				output:     "Веб-терминал: " + terminalURL + "\n" + output.String(),
-				connection: &connection,
-				cleanup:    cleanup,
-				err:        &playbookRunError{Phase: "prepare playbook host", Err: err},
-			}
-		}
-		steps := []struct {
-			name     string
-			playbook string
-		}{
-			{"Создание инфраструктуры", item.exercise.Playbooks.Infra},
-			{"Внесение инцидента", item.exercise.Playbooks.Incident},
-		}
-		for _, step := range steps {
-			fmt.Fprintf(&output, "\n━━ %s ━━\n", step.name)
-			if err := runPlaybook(client, remoteWorkDir, item.exercise, item.dir, step.playbook, nil); err != nil {
-				return operationResult{kind: operationStart, output: "Веб-терминал: " + terminalURL + "\n" + output.String(), connection: &connection, cleanup: cleanup, err: err}
-			}
-		}
-		return operationResult{kind: operationStart, output: "Веб-терминал: " + terminalURL + "\n" + output.String(), connection: &connection, cleanup: cleanup}
+	run := &solutionRun{
+		provider:      apiProvider,
+		item:          item,
+		remoteWorkDir: m.remoteWorkDir,
 	}
+	m.solution = run
+	m.screen, m.busy, m.status, m.logs = screenSolution, true, "Проверяю токен…", ""
+	return m, run.checkCapabilitiesCmd()
+}
+
+func (r *solutionRun) checkCapabilitiesCmd() tea.Cmd {
+	return func() tea.Msg {
+		_, err := r.provider.Capabilities(context.Background())
+		return solutionStageResult{run: r, stage: solutionCheckCapabilities, err: err}
+	}
+}
+
+func (r *solutionRun) createVMCmd() tea.Cmd {
+	return func() tea.Msg {
+		instance, err := r.provider.CreateVM(context.Background(), vm.RequestFromExercise(r.item.exercise))
+		if err == nil {
+			r.instance = instance
+		}
+		return solutionStageResult{run: r, stage: solutionCreateVM, err: err}
+	}
+}
+
+func (r *solutionRun) connectSSHCmd() tea.Cmd {
+	return func() tea.Msg {
+		connection, cleanup, err := r.provider.SSHConnection(context.Background(), r.instance.ID)
+		if err == nil {
+			r.connection, r.cleanup = connection, cleanup
+			r.client = remote.NewWithWriters(connection, &r.output, &r.output)
+		}
+		return solutionStageResult{run: r, stage: solutionConnectSSH, err: err}
+	}
+}
+
+func (r *solutionRun) prepareAnsibleCmd() tea.Cmd {
+	return func() tea.Msg {
+		fmt.Fprintln(&r.output, "\n━━ Подготовка Ansible ━━")
+		err := preparePlaybookHost(r.client, r.item.exercise)
+		if err != nil {
+			err = &playbookRunError{Phase: "prepare playbook host", Err: err}
+		}
+		return solutionStageResult{run: r, stage: solutionPrepareAnsible, err: err}
+	}
+}
+
+func (r *solutionRun) applyInfraCmd() tea.Cmd {
+	return r.applyPlaybookCmd(solutionApplyInfra, "Создание инфраструктуры", r.item.exercise.Playbooks.Infra)
+}
+
+func (r *solutionRun) applyIncidentCmd() tea.Cmd {
+	return r.applyPlaybookCmd(solutionApplyIncident, "Внесение инцидента", r.item.exercise.Playbooks.Incident)
+}
+
+func (r *solutionRun) applyPlaybookCmd(stage solutionStage, title, playbook string) tea.Cmd {
+	return func() tea.Msg {
+		fmt.Fprintf(&r.output, "\n━━ %s ━━\n", title)
+		err := runPlaybook(r.client, r.remoteWorkDir, r.item.exercise, r.item.dir, playbook, nil)
+		return solutionStageResult{run: r, stage: stage, err: err}
+	}
+}
+
+func (r *solutionRun) verifyIncidentCmd() tea.Cmd {
+	return func() tea.Msg {
+		fmt.Fprintln(&r.output, "\n━━ Проверка воспроизведения инцидента ━━")
+		err := runPlaybook(r.client, r.remoteWorkDir, r.item.exercise, r.item.dir, r.item.exercise.Playbooks.Verification, nil)
+		if err == nil {
+			return solutionStageResult{run: r, stage: solutionVerifyIncident, err: errors.New("verification неожиданно прошла после внесения инцидента")}
+		}
+		if !isExpectedVerificationFailure(err) {
+			return solutionStageResult{run: r, stage: solutionVerifyIncident, err: fmt.Errorf("не удалось подтвердить ошибку инфраструктуры: %w", err)}
+		}
+		fmt.Fprintln(&r.output, "verification завершилась с ненулевым кодом — ожидаемый результат.")
+		return solutionStageResult{run: r, stage: solutionVerifyIncident}
+	}
+}
+
+func (r *solutionRun) openTerminalCmd() tea.Cmd {
+	return func() tea.Msg {
+		terminalURL, err := r.provider.TerminalURL(context.Background(), r.instance.ID)
+		if err == nil {
+			r.terminalURL = terminalURL
+			err = openBrowserURL(terminalURL)
+		}
+		if err != nil {
+			return solutionStageResult{run: r, stage: solutionOpenTerminal, err: fmt.Errorf("не удалось открыть веб-терминал: %w", err)}
+		}
+		fmt.Fprintln(&r.output, "\nВеб-терминал открыт: "+terminalURL)
+		return solutionStageResult{run: r, stage: solutionOpenTerminal}
+	}
+}
+
+func (m *tuiModel) adoptSolutionConnection(run *solutionRun) {
+	if run.cleanup == nil {
+		return
+	}
+	m.releaseSSH()
+	m.connection = &run.connection
+	m.sshCleanup = run.cleanup
+	run.cleanup = nil
 }
 
 func (m *tuiModel) releaseSSH() {
