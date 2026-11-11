@@ -63,6 +63,7 @@ type operationResult struct {
 	kind       operation
 	output     string
 	connection *vm.Connection
+	cleanup    func()
 	status     string
 	err        error
 }
@@ -76,6 +77,7 @@ type tuiModel struct {
 	provider         vm.ConnectionProvider
 	remoteWorkDir    string
 	connection       *vm.Connection
+	sshCleanup       func()
 	exercises        []exerciseItem
 	screen           tuiScreen
 	returnTo         tuiScreen
@@ -174,7 +176,9 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.busy = false
 		m.logs = msg.output
 		if msg.connection != nil {
+			m.releaseSSH()
 			m.connection = msg.connection
+			m.sshCleanup = msg.cleanup
 		}
 		if msg.err != nil {
 			m.status = "Ошибка: " + msg.err.Error()
@@ -199,6 +203,7 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
+			m.releaseSSH()
 			return m, tea.Quit
 		}
 		if m.busy {
@@ -269,6 +274,7 @@ func (m tuiModel) updateKey(key string) (tea.Model, tea.Cmd) {
 	case screenSolution:
 		switch key {
 		case "q":
+			m.releaseSSH()
 			return m, tea.Quit
 		case "d":
 			m.screen, m.returnTo, m.scroll = screenDescription, screenSolution, 0
@@ -287,6 +293,7 @@ func (m tuiModel) updateKey(key string) (tea.Model, tea.Cmd) {
 		case "a":
 			return m.startTokenInput(screenSolution)
 		case "x", "esc":
+			m.releaseSSH()
 			m.screen, m.status, m.logs, m.connection = screenExercises, "", "", nil
 		}
 	}
@@ -366,6 +373,7 @@ func (m tuiModel) startSolution() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.screen, m.busy, m.status, m.logs = screenSolution, true, "Проверяю токен и создаю виртуальную машину…", ""
+	remoteWorkDir := m.remoteWorkDir
 	return m, func() tea.Msg {
 		ctx := context.Background()
 		if _, err := apiProvider.Capabilities(ctx); err != nil {
@@ -395,8 +403,49 @@ func (m tuiModel) startSolution() (tea.Model, tea.Cmd) {
 				err:    fmt.Errorf("не удалось открыть веб-терминал: %w", err),
 			}
 		}
-		return operationResult{kind: operationStart, output: "Веб-терминал: " + terminalURL}
+
+		connection, cleanup, err := apiProvider.SSHConnection(ctx, instance.ID)
+		if err != nil {
+			if errors.Is(err, vm.ErrTokenExpired) {
+				return operationResult{kind: operationStart, status: tokenExpiredMessage}
+			}
+			return operationResult{kind: operationStart, status: serverBusyMessage}
+		}
+		var output bytes.Buffer
+		client := remote.NewWithWriters(connection, &output, &output)
+		fmt.Fprintln(&output, "\n━━ Подготовка Ansible ━━")
+		if err := preparePlaybookHost(client, item.exercise); err != nil {
+			return operationResult{
+				kind:       operationStart,
+				output:     "Веб-терминал: " + terminalURL + "\n" + output.String(),
+				connection: &connection,
+				cleanup:    cleanup,
+				err:        &playbookRunError{Phase: "prepare playbook host", Err: err},
+			}
+		}
+		steps := []struct {
+			name     string
+			playbook string
+		}{
+			{"Создание инфраструктуры", item.exercise.Playbooks.Infra},
+			{"Внесение инцидента", item.exercise.Playbooks.Incident},
+		}
+		for _, step := range steps {
+			fmt.Fprintf(&output, "\n━━ %s ━━\n", step.name)
+			if err := runPlaybook(client, remoteWorkDir, item.exercise, item.dir, step.playbook, nil); err != nil {
+				return operationResult{kind: operationStart, output: "Веб-терминал: " + terminalURL + "\n" + output.String(), connection: &connection, cleanup: cleanup, err: err}
+			}
+		}
+		return operationResult{kind: operationStart, output: "Веб-терминал: " + terminalURL + "\n" + output.String(), connection: &connection, cleanup: cleanup}
 	}
+}
+
+func (m *tuiModel) releaseSSH() {
+	if m.sshCleanup != nil {
+		m.sshCleanup()
+		m.sshCleanup = nil
+	}
+	m.connection = nil
 }
 
 func isExpectedVerificationFailure(err error) bool {
@@ -440,6 +489,9 @@ func sshCommand(target vm.Connection) string {
 	args := []string{"ssh", "-p", strconv.Itoa(target.Port), "-o", "BatchMode=yes"}
 	if target.IdentityFile != "" {
 		args = append(args, "-i", target.IdentityFile)
+	}
+	if target.Bastion != nil {
+		args = append(args, "-J", target.Bastion.User+"@"+target.Bastion.Host+":"+strconv.Itoa(target.Bastion.Port))
 	}
 	strict := "accept-new"
 	if target.StrictHostKeyChecking {

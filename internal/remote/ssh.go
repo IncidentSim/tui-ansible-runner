@@ -93,6 +93,9 @@ func (c *Client) command(remoteCommand string) *exec.Cmd {
 	if c.config.IdentityFile != "" {
 		args = append(args, "-i", c.config.IdentityFile)
 	}
+	if c.config.Bastion != nil && c.config.Bastion.Host != "" && c.config.Bastion.Port > 0 && c.config.Bastion.User != "" {
+		args = append(args, "-J", fmt.Sprintf("%s@%s:%d", c.config.Bastion.User, c.config.Bastion.Host, c.config.Bastion.Port))
+	}
 	if c.config.StrictHostKeyChecking {
 		args = append(args, "-o", "StrictHostKeyChecking=yes")
 	} else {

@@ -14,9 +14,16 @@ type Connection struct {
 	IP                    string
 	Port                  int
 	User                  string
+	Bastion               *Bastion
 	Password              *string
 	IdentityFile          string
 	StrictHostKeyChecking bool
+}
+
+type Bastion struct {
+	Host string
+	Port int
+	User string
 }
 
 type Request struct {

@@ -17,6 +17,7 @@ func TestRemoteBashScriptsHaveValidSyntax(t *testing.T) {
 	scripts := map[string]string{
 		"ssh-check":  sshCheckScript,
 		"connection": connectionIPScript,
+		"bootstrap":  bootstrapScript,
 		"upload":     uploadScript,
 		"playbook":   playbookScript,
 	}

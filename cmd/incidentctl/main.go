@@ -208,6 +208,22 @@ func runPlaybook(client *remote.Client, remoteWorkDir string, exercise config.Ex
 	return nil
 }
 
+func preparePlaybookHost(client *remote.Client, exercise config.Exercise) error {
+	packages := make([]string, 0, len(exercise.Runtime.BootstrapPackages)+1)
+	seen := make(map[string]struct{}, len(exercise.Runtime.BootstrapPackages)+1)
+	for _, pkg := range exercise.Runtime.BootstrapPackages {
+		if _, exists := seen[pkg.Name]; exists {
+			continue
+		}
+		seen[pkg.Name] = struct{}{}
+		packages = append(packages, pkg.Name)
+	}
+	if _, exists := seen["ansible-core"]; !exists {
+		packages = append(packages, "ansible-core")
+	}
+	return client.RunScript(bootstrapScript, packages...)
+}
+
 func makeArchive(root string) ([]byte, error) {
 	var output bytes.Buffer
 	w := tar.NewWriter(&output)
@@ -295,6 +311,21 @@ const connectionIPScript = `set -euo pipefail
 ip_address="$(hostname -I | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+\./) { print $i; exit } }')"
 test -n "$ip_address"
 printf '%s\n' "$ip_address"
+`
+
+const bootstrapScript = `set -euo pipefail
+missing=()
+for package in "$@"; do
+  if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q '^install ok installed$'; then
+    missing+=("$package")
+  fi
+done
+if ((${#missing[@]} > 0)); then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y --no-install-recommends "${missing[@]}"
+fi
+command -v ansible-playbook
 `
 
 const uploadScript = `set -euo pipefail

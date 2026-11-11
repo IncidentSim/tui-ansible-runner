@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -48,6 +49,7 @@ type APIProvider interface {
 	Capabilities(context.Context) (Capabilities, error)
 	CreateVM(context.Context, *Request) (VirtualMachine, error)
 	TerminalURL(context.Context, string) (string, error)
+	SSHConnection(context.Context, string) (Connection, func(), error)
 	SetToken(string)
 }
 
@@ -157,6 +159,77 @@ func (p *MicroVMServiceProvider) TerminalURL(ctx context.Context, vmID string) (
 	return operation.Result.URL, nil
 }
 
+func (p *MicroVMServiceProvider) SSHConnection(ctx context.Context, vmID string) (Connection, func(), error) {
+	if p.currentToken() == "" {
+		return Connection{}, nil, ErrTokenRequired
+	}
+	if strings.TrimSpace(vmID) == "" {
+		return Connection{}, nil, errors.New("VM id is required")
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, time.Duration(p.config.TimeoutSeconds)*time.Second)
+	defer cancel()
+	for {
+		var metadata sshMetadata
+		path := "/v1/vms/" + url.PathEscape(vmID) + "/ssh"
+		if err := p.doJSON(waitCtx, http.MethodGet, path, nil, &metadata, ""); err != nil {
+			return Connection{}, nil, err
+		}
+		if metadata.Ready {
+			if metadata.Host == "" || metadata.Port < 1 || metadata.User == "" {
+				return Connection{}, nil, errors.New("VM service returned incomplete SSH metadata")
+			}
+			return p.connectionFromSSHMetadata(waitCtx, vmID, metadata)
+		}
+		select {
+		case <-waitCtx.Done():
+			return Connection{}, nil, fmt.Errorf("wait for SSH readiness: %w", waitCtx.Err())
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+func (p *MicroVMServiceProvider) connectionFromSSHMetadata(ctx context.Context, vmID string, metadata sshMetadata) (Connection, func(), error) {
+	var key sshKeyResponse
+	if err := p.doJSON(ctx, http.MethodGet, "/v1/vms/"+url.PathEscape(vmID)+"/ssh-key", nil, &key, ""); err != nil {
+		return Connection{}, nil, err
+	}
+	if key.PrivateKey == "" {
+		return Connection{}, nil, errors.New("VM service did not return an SSH private key")
+	}
+	file, err := os.CreateTemp("", "incidentctl-ssh-*")
+	if err != nil {
+		return Connection{}, nil, fmt.Errorf("create temporary SSH key: %w", err)
+	}
+	path := file.Name()
+	removeKey := func() { _ = os.Remove(path) }
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		removeKey()
+		return Connection{}, nil, fmt.Errorf("protect temporary SSH key: %w", err)
+	}
+	if _, err := file.WriteString(key.PrivateKey); err != nil {
+		_ = file.Close()
+		removeKey()
+		return Connection{}, nil, fmt.Errorf("write temporary SSH key: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		removeKey()
+		return Connection{}, nil, fmt.Errorf("close temporary SSH key: %w", err)
+	}
+	var bastion *Bastion
+	if metadata.Bastion.Host != "" && metadata.Bastion.Port > 0 && metadata.Bastion.User != "" {
+		bastion = &Bastion{Host: metadata.Bastion.Host, Port: metadata.Bastion.Port, User: metadata.Bastion.User}
+	}
+	return Connection{
+		Host:                  metadata.Host,
+		Port:                  metadata.Port,
+		User:                  metadata.User,
+		IdentityFile:          path,
+		Bastion:               bastion,
+		StrictHostKeyChecking: false,
+	}, removeKey, nil
+}
+
 // Connection remains available for the legacy SSH implementation. The TUI
 // uses the API terminal flow, but callers that still use SSH are unchanged.
 func (p *MicroVMServiceProvider) Connection(context.Context, *Request) (Connection, error) {
@@ -177,6 +250,25 @@ type createVMResponse struct {
 
 type terminalResponse struct {
 	OperationID string `json:"operation_id"`
+}
+
+type sshMetadata struct {
+	VMID               string `json:"vm_id"`
+	Host               string `json:"host"`
+	Port               int    `json:"port"`
+	User               string `json:"user"`
+	HostKeyFingerprint string `json:"host_key_fingerprint"`
+	Ready              bool   `json:"ready"`
+	AuthMode           string `json:"auth_mode"`
+	Bastion            struct {
+		Host string `json:"host"`
+		Port int    `json:"port"`
+		User string `json:"user"`
+	} `json:"bastion"`
+}
+
+type sshKeyResponse struct {
+	PrivateKey string `json:"private_key"`
 }
 
 type operationResponse struct {
