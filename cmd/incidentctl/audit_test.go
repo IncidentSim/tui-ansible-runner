@@ -160,7 +160,7 @@ func TestAuditAnalysisRunsOnlyAfterSuccessfulValidation(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(a.LLMReportsDir, "example", "1", "analysis.json")); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output.String(), "Постмортем LLM готов. Отчёт:") {
+	if !strings.Contains(output.String(), "Постмортем готов. Отчёт:") {
 		t.Fatalf("missing readable LLM result: %s", output.String())
 	}
 }

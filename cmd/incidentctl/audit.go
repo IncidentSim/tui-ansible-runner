@@ -268,7 +268,7 @@ func (a auditOptions) analyzeReport(report, name, dir string, output io.Writer) 
 	if err := os.Remove(staged); err != nil {
 		return err
 	}
-	fmt.Fprintf(output, "\nПостмортем LLM готов. Отчёт: %s\n", filepath.Join(solution, "analysis.md"))
+	fmt.Fprintf(output, "\nПостмортем готов. Отчёт: %s\n", filepath.Join(solution, "analysis.md"))
 	return nil
 }
 
