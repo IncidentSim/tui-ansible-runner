@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"path/filepath"
+	"time"
 
 	"incidentctl/internal/config"
 	"incidentctl/internal/remote"
@@ -19,6 +20,9 @@ type playbookClient interface {
 	RunScript(script string, args ...string) error
 }
 
+// legacyVerificationTimeout bounds exercises without a manifest timeout.
+const legacyVerificationTimeout = 10 * time.Minute
+
 // verifyExercise is the single verification entry point for CLI, TUI and the
 // audit flow. Manifest exercises run through the structured report engine;
 // legacy exercises keep the playbook exit-code contract.
@@ -31,7 +35,17 @@ func verifyExercise(ctx context.Context, client playbookClient, remoteWorkDir st
 		if playbook == "" {
 			playbook = exercise.Playbooks.Verification
 		}
-		return nil, runPlaybook(client, remoteWorkDir, exercise, dir, playbook, extra)
+		// Legacy contract (exit code), but in an isolated attempt directory:
+		// verification never deletes or re-extracts the exercise workspace.
+		err := verifier.RunLegacy(ctx, client, verifier.Spec{
+			Name: exercise.Name, ExerciseDir: dir, CollectionsDir: filepath.Join(exercise.Root, "collections"),
+			WorkDir: remoteWorkDir, Playbook: playbook, Timeout: legacyVerificationTimeout, ExtraArgs: extra,
+		}, out)
+		var phase *verifier.PhaseError
+		if errors.As(err, &phase) {
+			return nil, &playbookRunError{Phase: phase.Phase, Err: phase.Err}
+		}
+		return nil, err
 	}
 	return verifier.Run(ctx, client, verifier.Spec{
 		Name:           exercise.Name,

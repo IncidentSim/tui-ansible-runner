@@ -22,7 +22,8 @@ type fakeVerifyClient struct {
 	status    verifier.Status
 	attempt   string
 	calls     []string
-	legacyErr error
+	scriptErr error // returned by the legacy execute script (not cleanup)
+	uploadErr error
 }
 
 func (f *fakeVerifyClient) RunShellInputContext(_ context.Context, script string, in io.Reader, args ...string) error {
@@ -31,10 +32,16 @@ func (f *fakeVerifyClient) RunShellInputContext(_ context.Context, script string
 	if len(args) == 3 {
 		f.attempt = args[2]
 	}
-	return nil
+	return f.uploadErr
 }
-func (f *fakeVerifyClient) RunScriptContext(_ context.Context, _ string, _ ...string) error {
+func (f *fakeVerifyClient) RunScriptContext(_ context.Context, script string, _ ...string) error {
 	f.calls = append(f.calls, "script")
+	if strings.Contains(script, "rm -rf") {
+		return nil // cleanup
+	}
+	if f.scriptErr != nil {
+		return f.scriptErr
+	}
 	if f.status != verifier.StatusPass {
 		return &remote.CommandError{ExitCode: 2} // a failed check fails the play
 	}
@@ -48,8 +55,8 @@ func (f *fakeVerifyClient) RunScriptOutputContext(_ context.Context, _ string, a
 	return string(data), nil
 }
 func (f *fakeVerifyClient) RunShellInput(string, io.Reader, ...string) error {
-	f.calls = append(f.calls, "legacy-upload")
-	return f.legacyErr
+	f.calls = append(f.calls, "legacy-upload") // would run the workspace-deleting script
+	return nil
 }
 func (f *fakeVerifyClient) RunScript(string, ...string) error {
 	f.calls = append(f.calls, "legacy-run")
@@ -108,18 +115,32 @@ func TestVerifyExerciseRoutesManifestToReportEngine(t *testing.T) {
 
 func TestVerifyExerciseKeepsLegacyExitCodeContract(t *testing.T) {
 	ex, dir := verifyTestExercise(t, false)
-	client := &fakeVerifyClient{}
+	client := &fakeVerifyClient{status: verifier.StatusPass}
 	result, err := verifyExercise(context.Background(), client, "/work", ex, dir, nil, io.Discard)
 	if err != nil || result != nil {
 		t.Fatalf("%v %v", result, err)
 	}
-	if got := strings.Join(client.calls, ","); got != "legacy-upload,legacy-run" {
+	// attempt-scoped upload + execute + cleanup; the workspace-resetting
+	// playbookClient.RunShellInput/RunScript path must never be used
+	if got := strings.Join(client.calls, ","); got != "upload,script,script" {
 		t.Fatalf("calls = %s", got)
 	}
-	client = &fakeVerifyClient{legacyErr: &remote.CommandError{ExitCode: 255}}
+	client = &fakeVerifyClient{scriptErr: &remote.CommandError{ExitCode: 2}}
 	_, err = verifyExercise(context.Background(), client, "/work", ex, dir, nil, io.Discard)
-	if err == nil || isRejectedVerification(err) {
-		t.Fatalf("transport failure must not be a rejection: %v", err)
+	if !isRejectedVerification(err) || !isExpectedVerificationFailure(err) {
+		t.Fatalf("exit 2 keeps meaning rejected for legacy: %v", err)
+	}
+	for _, code := range []int{1, 124, 255} {
+		client = &fakeVerifyClient{scriptErr: &remote.CommandError{ExitCode: code}}
+		_, err = verifyExercise(context.Background(), client, "/work", ex, dir, nil, io.Discard)
+		if err == nil || isRejectedVerification(err) {
+			t.Fatalf("exit %d must not be a rejection: %v", code, err)
+		}
+	}
+	client = &fakeVerifyClient{uploadErr: &remote.CommandError{ExitCode: 255}}
+	_, err = verifyExercise(context.Background(), client, "/work", ex, dir, nil, io.Discard)
+	if err == nil || isRejectedVerification(err) || isExpectedVerificationFailure(err) {
+		t.Fatalf("upload failure must not be a verdict: %v", err)
 	}
 }
 

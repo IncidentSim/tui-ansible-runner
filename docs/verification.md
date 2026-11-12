@@ -7,7 +7,10 @@ Architecture decision: [adr/0001-ansible-verifier.md](adr/0001-ansible-verifier.
 `exersice/<name>/manifest.yaml` (preferred) next to `vm.json`; `exersice/collections/`
 holds the `incidentsim.verify` Ansible collection. Exercises that only have
 `vm.json` are legacy: their verification playbook exit code stays authoritative
-(exit 2 = rejected, anything else = technical error).
+(exit 2 = rejected, anything else, including timeout 124, = technical error).
+Legacy verification also runs from a fresh `<work>/.verify/<exercise>/<attempt>/`
+copy of the exercise (10 minute timeout, collection provided if present); the
+workspace-resetting upload used for `infra`/`incident` is never used for verification.
 
 ## Run of a manifest verification
 
@@ -29,8 +32,11 @@ holds the `incidentsim.verify` Ansible collection. Exercises that only have
 | Outcome | Meaning |
 | --- | --- |
 | report `pass` | solution accepted |
-| report `fail` | explicit failed check: rejected / incident reproduced |
-| report `error`, missing/invalid/stale/oversized report, timeout, SSH failure (exit 255 or context error), audit resume failure | technical error, never a verdict |
+| report `fail` **and** ansible-playbook exit 2 | explicit failed check: rejected / incident reproduced |
+| any other ansible-playbook exit (0 with a fail report, 1, 4, 124/137 timeout, 143 signal, 255 SSH, ...) | technical error even if a report file exists |
+| report `error`, missing/invalid/stale/oversized report, context cancellation, audit resume failure | technical error, never a verdict |
+
+If audit recording cannot be resumed after verification, no LLM analysis is started.
 
 The TUI's "incident reproduced" check after injection uses the same engine and
 accepts only a validated `fail` report.

@@ -168,6 +168,64 @@ func run(ctx context.Context, client Remote, spec Spec, attempt string, out io.W
 	}
 }
 
+// PhaseError tags a legacy verification failure with the phase it happened in
+// ("upload exercise" or "execute playbook").
+type PhaseError struct {
+	Phase string
+	Err   error
+}
+
+func (e *PhaseError) Error() string { return e.Phase + ": " + e.Err.Error() }
+func (e *PhaseError) Unwrap() error { return e.Err }
+
+// RunLegacy runs a vm.json-only verification playbook with its original exit
+// code contract (0 passed, 2 rejected, anything else technical), but like the
+// manifest engine it works in a fresh attempt directory: the exercise workspace
+// is never deleted or re-extracted. The whole exercise is copied (legacy
+// playbooks may use sibling files) and the collection is provided when present.
+func RunLegacy(ctx context.Context, client Remote, spec Spec, out io.Writer) error {
+	attempt := NewAttemptID()
+	if err := spec.validateLegacy(); err != nil {
+		return &PhaseError{Phase: "upload exercise", Err: err}
+	}
+	bundle, err := buildLegacyBundle(spec)
+	if err != nil {
+		return &PhaseError{Phase: "upload exercise", Err: err}
+	}
+	upCtx, cancel := context.WithTimeout(ctx, uploadTimeout)
+	err = client.RunShellInputContext(upCtx, uploadScript, bytes.NewReader(bundle), spec.WorkDir, spec.Name, attempt)
+	cancel()
+	if err != nil {
+		return &PhaseError{Phase: "upload exercise", Err: err}
+	}
+	defer cleanup(client, spec, attempt)
+	args := []string{spec.WorkDir, spec.Name, attempt, filepath.ToSlash(spec.Playbook), strconv.Itoa(int(spec.Timeout / time.Second))}
+	args = append(args, spec.ExtraArgs...)
+	execCtx, cancel := context.WithTimeout(ctx, spec.Timeout+executionGrace)
+	defer cancel()
+	if err := client.RunScriptContext(execCtx, legacyExecuteScript, args...); err != nil {
+		return &PhaseError{Phase: "execute playbook", Err: err}
+	}
+	return nil
+}
+
+func (s Spec) validateLegacy() error {
+	if !config.SafeName(s.Name) {
+		return fmt.Errorf("invalid exercise name %q", s.Name)
+	}
+	if !path.IsAbs(s.WorkDir) || path.Clean(s.WorkDir) == "/" || strings.ContainsAny(s.WorkDir, "\r\n") {
+		return errors.New("work directory must be an absolute path other than /")
+	}
+	clean := filepath.Clean(s.Playbook)
+	if s.Playbook == "" || filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(filepath.ToSlash(clean), "../") {
+		return fmt.Errorf("verification playbook %q must be a relative path inside the exercise", s.Playbook)
+	}
+	if s.Timeout < time.Second || s.ExerciseDir == "" {
+		return errors.New("a positive timeout and the exercise directory are required")
+	}
+	return nil
+}
+
 // ansibleTaskFailed is ansible-playbook's status for "a task failed", the only
 // non-zero status that may accompany a report.
 const ansibleTaskFailed = 2
@@ -216,7 +274,12 @@ func (s Spec) validate() error {
 
 // buildBundle ships only the verification directory and the collection. The
 // rest of the exercise (and any workspace state on the VM) is never touched.
-func buildBundle(spec Spec) ([]byte, error) {
+func buildBundle(spec Spec) ([]byte, error) { return buildBundleMode(spec, false) }
+
+// buildLegacyBundle ships the whole exercise (never into the workspace).
+func buildLegacyBundle(spec Spec) ([]byte, error) { return buildBundleMode(spec, true) }
+
+func buildBundleMode(spec Spec, legacy bool) ([]byte, error) {
 	var buf bytes.Buffer
 	w := tar.NewWriter(&buf)
 	total := int64(0)
@@ -272,16 +335,29 @@ func buildBundle(spec Spec) ([]byte, error) {
 			return err
 		})
 	}
-	for _, dir := range []string{"bundle", "collections"} {
+	roots := []string{"bundle", "collections"}
+	if legacy {
+		roots = []string{"collections"} // "bundle" is written by the exercise copy itself
+	}
+	for _, dir := range roots {
 		if err := w.WriteHeader(&tar.Header{Name: dir, Typeflag: tar.TypeDir, Mode: 0o700}); err != nil {
 			return nil, err
 		}
 	}
-	verificationDir := filepath.Dir(filepath.Clean(spec.Playbook))
-	if err := add(filepath.Join(spec.ExerciseDir, verificationDir), path.Join("bundle", filepath.ToSlash(verificationDir)), false); err != nil {
-		return nil, fmt.Errorf("bundle verification: %w", err)
+	if legacy {
+		if err := add(spec.ExerciseDir, "bundle", false); err != nil {
+			return nil, fmt.Errorf("bundle exercise: %w", err)
+		}
+	} else {
+		verificationDir := filepath.Dir(filepath.Clean(spec.Playbook))
+		if err := add(filepath.Join(spec.ExerciseDir, verificationDir), path.Join("bundle", filepath.ToSlash(verificationDir)), false); err != nil {
+			return nil, fmt.Errorf("bundle verification: %w", err)
+		}
 	}
-	if err := add(filepath.Join(spec.CollectionsDir, "ansible_collections"), "collections/ansible_collections", true); err != nil {
+	collections := filepath.Join(spec.CollectionsDir, "ansible_collections")
+	if _, statErr := os.Stat(collections); legacy && (spec.CollectionsDir == "" || os.IsNotExist(statErr)) {
+		// the collection is optional for legacy exercises
+	} else if err := add(collections, "collections/ansible_collections", true); err != nil {
 		return nil, fmt.Errorf("bundle collection: %w", err)
 	}
 	if _, err := os.Stat(filepath.Join(spec.ExerciseDir, spec.Playbook)); err != nil {
@@ -325,7 +401,20 @@ if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then echo "verification timed out aft
 exit "$rc"
 `
 
-const fetchScript = `set -euo pipefail
+// Legacy contract: ansible-playbook's own exit status is the verdict (the
+// script propagates it, including 124 from a timeout). The collection is put on
+// the collections path only when it was shipped.
+const legacyExecuteScript = `set -uo pipefail
+work="$1"; name="$2"; attempt="$3"; playbook="$4"; timeout_seconds="$5"; shift 5
+target="$work/.verify/$name/$attempt"
+if [ ! -f "$target/bundle/$playbook" ]; then echo "verification playbook is missing from the bundle" >&2; exit 64; fi
+cd "$target/bundle"
+export ANSIBLE_NOCOWS=1 ANSIBLE_HOST_KEY_CHECKING=True ANSIBLE_RETRY_FILES_ENABLED=False
+if [ -d "$target/collections/ansible_collections" ]; then export ANSIBLE_COLLECTIONS_PATH="$target/collections"; fi
+timeout --kill-after=10s "$timeout_seconds" ansible-playbook --inventory 'localhost,' --connection local "$playbook" "$@"
+`
+
+const fetchScript =`set -euo pipefail
 file="$1/.verify/$2/$3/report.json"; max="$4"
 if [ ! -f "$file" ]; then echo "verifier produced no report" >&2; exit 66; fi
 size="$(stat -c %s "$file")"
