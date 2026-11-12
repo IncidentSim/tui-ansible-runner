@@ -83,6 +83,7 @@ case "$FAKE_MODE" in
   fail) { head; echo '"status":"fail","checks":[{"id":"a","status":"fail","observed":"404","expected":"200"}]}'; } > "$INCIDENTSIM_REPORT_PATH"; exit 2 ;;
   error) { head; echo '"status":"error","checks":[{"id":"a","status":"error","evidence":"psql: not found"}]}'; } > "$INCIDENTSIM_REPORT_PATH"; exit 2 ;;
   pass_but_crash) { head; echo '"status":"pass","checks":[{"id":"a","status":"pass"},{"id":"b","status":"pass"}]}'; } > "$INCIDENTSIM_REPORT_PATH"; exit 4 ;;
+  fail_rc) { head; echo '"status":"fail","checks":[{"id":"a","status":"fail","observed":"404","expected":"200"}]}'; } > "$INCIDENTSIM_REPORT_PATH"; exit "$FAKE_RC" ;;
   none) exit 2 ;;
   wrong_attempt) printf '{"schema":"%s","scenario":"%s","attempt_id":"ZZZZZZZZZZZZZZZZZZZZZZZZZZ","complete":true,"status":"pass","checks":[{"id":"a","status":"pass"},{"id":"b","status":"pass"}]}' "$INCIDENTSIM_REPORT_SCHEMA" "$INCIDENTSIM_SCENARIO" > "$INCIDENTSIM_REPORT_PATH" ;;
   garbage) echo 'not json' > "$INCIDENTSIM_REPORT_PATH" ;;
@@ -233,7 +234,7 @@ func TestRunVerdicts(t *testing.T) {
 	}{
 		{"fail", true, "", true},
 		{"error", false, "verifier error", true},
-		{"pass_but_crash", false, "execute", true},
+		{"pass_but_crash", false, "execute", false},
 		{"none", false, "fetch report", false},
 		{"wrong_attempt", false, "validate report", false},
 		{"garbage", false, "validate report", false},
@@ -259,6 +260,46 @@ func TestRunVerdicts(t *testing.T) {
 				t.Fatalf("result presence = %v", result != nil)
 			}
 		})
+	}
+}
+
+// Only a normal ansible-playbook "task failed" status (2) may accompany a fail
+// report. Timeouts (124/137), signals (143), syntax errors (4), usage errors and
+// generic failures leave a report that cannot be trusted as a verdict, even if a
+// valid "fail" JSON happens to exist.
+func TestRunFailReportIsOnlyAcceptedWithAnsibleExitTwo(t *testing.T) {
+	for _, tc := range []struct {
+		rc       string
+		rejected bool
+	}{{"2", true}, {"0", false}, {"1", false}, {"3", false}, {"4", false}, {"5", false}, {"99", false}, {"124", false}, {"137", false}, {"143", false}, {"64", false}} {
+		t.Run("rc"+tc.rc, func(t *testing.T) {
+			f := newFixture(t, "fail_rc")
+			f.remote.env = append(f.remote.env, "FAKE_RC="+tc.rc)
+			result, err := run(context.Background(), f.remote, f.spec, fixedAttempt, io.Discard)
+			var rejected *RejectedError
+			var te *TechnicalError
+			if tc.rejected {
+				if !errors.As(err, &rejected) {
+					t.Fatalf("rc 2 with a fail report is a rejection: %v", err)
+				}
+				return
+			}
+			if errors.As(err, &rejected) || !errors.As(err, &te) || (result != nil && tc.rc != "0") {
+				t.Fatalf("rc %s must be technical regardless of the report: %v (%v)", tc.rc, err, result)
+			}
+		})
+	}
+}
+
+func TestRunCancellationWithExistingFailReportIsTechnical(t *testing.T) {
+	f := newFixture(t, "fail_rc")
+	f.remote.env = append(f.remote.env, "FAKE_RC=2")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := run(ctx, f.remote, f.spec, fixedAttempt, io.Discard)
+	var rejected *RejectedError
+	if err == nil || errors.As(err, &rejected) {
+		t.Fatalf("cancelled run must not yield a verdict: %v", err)
 	}
 }
 
@@ -299,7 +340,7 @@ func TestRunRemoteTimeoutProducesNoVerdict(t *testing.T) {
 	_, err := run(context.Background(), f.remote, f.spec, fixedAttempt, nil)
 	var te *TechnicalError
 	var rejected *RejectedError
-	if !errors.As(err, &te) || errors.As(err, &rejected) || te.Phase != "fetch report" {
+	if !errors.As(err, &te) || errors.As(err, &rejected) || te.Phase != "execute" {
 		t.Fatalf("timeout must not be a rejected solution: %v", err)
 	}
 }

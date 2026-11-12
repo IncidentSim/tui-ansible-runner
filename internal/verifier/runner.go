@@ -126,7 +126,9 @@ func run(ctx context.Context, client Remote, spec Spec, attempt string, out io.W
 	execCtx, cancel := context.WithTimeout(ctx, spec.Timeout+executionGrace)
 	execErr := client.RunScriptContext(execCtx, executeScript, args...)
 	cancel()
-	if execErr != nil && (ctx.Err() != nil || remote.IsTransportError(execErr) || !remote.IsCommandError(execErr)) {
+	if execErr != nil && (ctx.Err() != nil || !acceptableExit(execErr)) {
+		// Timeouts (124/137), signals, syntax/usage errors, SSH failures and
+		// cancellation are technical regardless of any report left behind.
 		return nil, technical("execute", execErr)
 	}
 
@@ -156,10 +158,23 @@ func run(ctx context.Context, client Remote, spec Spec, attempt string, out io.W
 		}
 		return result, nil
 	case StatusFail:
+		if execErr == nil {
+			// A clean exit cannot accompany a failed check (the check task fails the play).
+			return result, &TechnicalError{Phase: "execute", Err: errors.New("report says fail but ansible-playbook exited 0"), Result: result}
+		}
 		return result, &RejectedError{Result: result}
 	default:
 		return result, &TechnicalError{Phase: "verifier error", Err: errors.New("a check could not be evaluated: " + errorChecks(report)), Result: result}
 	}
+}
+
+// ansibleTaskFailed is ansible-playbook's status for "a task failed", the only
+// non-zero status that may accompany a report.
+const ansibleTaskFailed = 2
+
+func acceptableExit(err error) bool {
+	var commandErr *remote.CommandError
+	return errors.As(err, &commandErr) && commandErr.ExitCode == ansibleTaskFailed
 }
 
 func errorChecks(r Report) string {
