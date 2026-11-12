@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -102,7 +101,7 @@ func TestAuditBundleExcludesLocalSecrets(t *testing.T) {
 		}
 		count++
 	}
-	if count != 7 {
+	if count != 1 {
 		t.Fatalf("bundle files: %d", count)
 	}
 }
@@ -116,7 +115,7 @@ func TestAuditPreparationStopsBeforeInstallAndStart(t *testing.T) {
 	if err := a.start(client, "/work", "example"); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(client.operations, ","); got != "reset,install,start" {
+	if got := strings.Join(client.operations, ","); got != "install,start" {
 		t.Fatalf("order: %s", got)
 	}
 }
@@ -124,7 +123,7 @@ func TestAuditPreparationStopsBeforeInstallAndStart(t *testing.T) {
 func auditTestPackage(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
-	for _, name := range []string{"install.py", "src/incident-audit.py", "src/incident_audit_capture.py", "src/incident_audit_compact.py", "config/50-incidentsim.rules", "config/incidentsim-json.conf", "config/incidentsim-audit.sh", "config/llm.local.json", ".secrets/deepseek-api-key"} {
+	for _, name := range []string{"bin/linux-amd64/incident-audit", "config/llm.local.json", ".secrets/deepseek-api-key"} {
 		path := filepath.Join(root, filepath.FromSlash(name))
 		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 			t.Fatal(err)
@@ -138,32 +137,10 @@ func auditTestPackage(t *testing.T) string {
 
 func TestAuditAnalysisRunsOnlyAfterSuccessfulValidation(t *testing.T) {
 	a := defaultAuditOptions()
-	if _, err := exec.LookPath(a.Python); err != nil {
-		t.Skip("local Python unavailable")
-	}
-	a.AgentDir = t.TempDir()
+	a.Binary, _ = os.Executable()
 	a.ReportsDir = t.TempDir()
 	a.LLMReportsDir = t.TempDir()
 	a.LLMConfig = "local-profile.json"
-	if err := os.Mkdir(filepath.Join(a.AgentDir, "src"), 0700); err != nil {
-		t.Fatal(err)
-	}
-	// Replace only the network-facing client; exercise the real process handoff and files.
-	script := `import json, sys
-from pathlib import Path
-args = dict(zip(sys.argv[1::2], sys.argv[2::2]))
-assert args['--config'] == 'local-profile.json'
-assert json.loads(Path(args['--input']).read_text())['session'] == 'attempt-1'
-assert json.loads(Path(args['--validation']).read_text())['passed'] is True
-assert Path(args['--task']).read_text() == 'Exercise goal'
-out = Path(args['--output'])
-out.mkdir()
-(out / 'analysis.md').write_text('Analysis complete')
-(out / 'analysis.json').write_text('{}')
-`
-	if err := os.WriteFile(filepath.Join(a.AgentDir, "src", "analyze.py"), []byte(script), 0600); err != nil {
-		t.Fatal(err)
-	}
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("Exercise goal"), 0600); err != nil {
 		t.Fatal(err)
@@ -189,7 +166,7 @@ out.mkdir()
 }
 
 func TestAuditLLMFailureFallsBackToAnsibleResult(t *testing.T) {
-	for _, failure := range []string{"missing-python", "client-error", "missing-task"} {
+	for _, failure := range []string{"missing-binary", "client-error", "missing-task"} {
 		for _, passed := range []bool{true, false} {
 			t.Run(fmt.Sprintf("%s/passed=%t", failure, passed), func(t *testing.T) {
 				a := defaultAuditOptions()
@@ -201,19 +178,12 @@ func TestAuditLLMFailureFallsBackToAnsibleResult(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				if failure == "missing-python" {
-					a.Python = filepath.Join(t.TempDir(), "missing-python.exe")
+				if failure == "missing-binary" {
+					a.Binary = filepath.Join(t.TempDir(), "missing-python.exe")
 				}
 				if failure == "client-error" {
-					if _, err := exec.LookPath(a.Python); err != nil {
-						t.Skip("Python unavailable")
-					}
-					if err := os.Mkdir(filepath.Join(a.AgentDir, "src"), 0700); err != nil {
-						t.Fatal(err)
-					}
-					if err := os.WriteFile(filepath.Join(a.AgentDir, "src", "analyze.py"), []byte("raise SystemExit(1)\n"), 0600); err != nil {
-						t.Fatal(err)
-					}
+					a.Binary, _ = os.Executable()
+					t.Setenv("INCIDENTCTL_TEST_AGENT_FAIL", "1")
 				}
 				var warning string
 				a.OnWarning = func(message string) { warning = message }
@@ -294,7 +264,7 @@ func TestSolutionNumbersAreUniqueAcrossConcurrentRuns(t *testing.T) {
 func TestAuditAutomaticallyResumesAfterEachValidation(t *testing.T) {
 	for _, failed := range []bool{false, true} {
 		client := &fakeAuditClient{packet: `{"session":"attempt-1"}`}
-		a := auditOptions{ReportsDir: t.TempDir(), LLMConfig: "configured", Python: "missing-python", AgentDir: t.TempDir()}
+		a := auditOptions{ReportsDir: t.TempDir(), LLMConfig: "configured", Binary: "missing-binary", AgentDir: t.TempDir()}
 		var want error
 		if failed {
 			want = errors.New("validation failed")

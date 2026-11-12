@@ -37,6 +37,7 @@ TUI использует VM service API: при запуске проверяе�
 
 ```bash
 cp incidentctl.example.json incidentctl.json
+go generate ./internal/auditbinary
 go build -o bin/incidentctl ./cmd/incidentctl
 ```
 
@@ -52,8 +53,10 @@ make check    # форматирование, тесты, vet и сборка
 
 Для постмортема LLM укажите в `incidentctl.json` `audit.llm.enabled: true`
 и DeepSeek-ключ в `audit.llm.api_key` либо переменной `DEEPSEEK_API_KEY`.
-Исходники audit-agent автоматически скачиваются из `audit.repository`
-в локальный Git-кеш; соседний checkout и отдельный LLM-конфиг не нужны.
+Готовые Go-бинарники audit-agent включены в TUI; LLM запускается отдельным процессом.
+Python на компьютере пользователя не нужен. Для сборки нужен соседний checkout
+`audit-agent` либо абсолютный путь к нему в `AUDIT_AGENT_DIR`.
+Поля `audit.repository` сохранены для совместимости конфигурации.
 После настройки достаточно `make run`.
 
 Дополнительные аргументы CLI можно передать через `ARGS`, например:

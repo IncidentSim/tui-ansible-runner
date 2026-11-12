@@ -6,22 +6,16 @@
 
 ## Запуск
 
-Все команды выполняются из `tui-ansible-runner`. Локально нужны Go 1.26,
-OpenSSH, Git с доступом к репозиториям упражнений и audit-agent, Python 3.10+
-для анализа LLM. Соседний каталог `audit-agent` не нужен: исходники скачиваются
-при подготовке агента из настроенного Git-репозитория в локальный кеш.
-На каждом запуске подготовки получается указанный `ref`; одна ревизия
-используется до конца текущего процесса CLI. Можно закрепить commit SHA.
-
-Сохраните ваш конфиг с `exercise_repository` и `vm_service` в `incidentctl.json`.
-Он совпадает с `incidentctl.example.json`. Поля `image_id` и `ttl_seconds`
-сохраняются в существующем API-потоке; менять их для audit не требуется.
-
-Windows PowerShell:
+Все команды выполняются из `tui-ansible-runner`. Для сборки нужны Go 1.26,
+исходники Go-агента в соседнем `audit-agent` либо абсолютный `AUDIT_AGENT_DIR`.
+`make build` собирает и включает два самостоятельных бинарника: для локального
+LLM-клиента и Linux x86_64 VM. Для запуска готового TUI Python и Go не нужны;
+OpenSSH и Git требуются для упражнений. LLM остаётся отдельным процессом.
 
 ```powershell
 # Если incidentctl.json ещё не создан:
 Copy-Item incidentctl.example.json incidentctl.json
+go generate ./internal/auditbinary
 go build -o bin/incidentctl.exe ./cmd/incidentctl
 .\bin\incidentctl.exe -config incidentctl.json
 ```
@@ -30,6 +24,7 @@ Linux/macOS:
 
 ```bash
 cp incidentctl.example.json incidentctl.json  # только при отсутствии своего конфига
+go generate ./internal/auditbinary
 go build -o bin/incidentctl ./cmd/incidentctl
 bin/incidentctl -config incidentctl.json
 ```
@@ -56,7 +51,8 @@ verification-проверку ожидаемой ошибки. Затем он �
 
 Целевая VM должна быть Ubuntu/Debian x86_64 с systemd, Python 3.10+,
 ядром с `CONFIG_AUDIT`/`CONFIG_AUDITSYSCALL` и доступом к APT. Установщик
-агента сам ставит `auditd` и `python3-audit` и проверяет поддержку audit.
+агента сам ставит только `auditd` и проверяет поддержку audit. Python в VM
+используется Ansible, самому агенту он не нужен.
 Существующий bootstrap/playbook-поток предполагает root SSH-доступ.
 Для управления агентом поддерживается и `sudo -n`.
 
@@ -136,11 +132,9 @@ ID независимо от результата, до сохранения о�
 }
 ```
 
-После этого достаточно `make run`. Git использует обычные SSH-ключи и настройки
-вашего компьютера; при необходимости замените SSH-host на свой alias либо
-укажите HTTPS URL. Нужен доступ к репозиторию. Ошибка скачивания показывается
-на этапе установки агента. Относительный `cache_dir` считается от каталога
-конфига; `~` поддерживается. Старые ревизии кеша не удаляются автоматически.
+После этого достаточно `make run`. Бинарники агента уже включены в TUI:
+на пользовательском компьютере Git-репозиторий audit-agent не скачивается.
+Поля `audit.repository` остаются совместимыми с прежними конфигами.
 
 `api_key` из JSON имеет приоритет; если он пуст, используется переменная
 из `api_key_env`. Ключ не записывается в Git-кеш или временный профиль и не
@@ -180,13 +174,14 @@ Ansible-проверку в ошибку и не скрывает неуспеш
 Ansible-проверки. Каждый успешный verify с LLM-флагом делает новый запрос;
 автоматических повторов платного запроса нет.
 
-Python-клиент LLM запускается на компьютере с CLI. При запуске из PowerShell
+Отдельный Go-клиент LLM запускается на компьютере с CLI. При запуске из PowerShell
 это ваш Windows-компьютер. Именно ему нужны LLM-профиль, API-ключ и доступ к сети;
 хост Firecracker и пользовательская VM ключ не получают. VM API-токен из TUI
 и API-ключ LLM — разные учётные данные для разных сервисов.
 
-Дополнительные флаги: `-audit-agent-dir ../audit-agent`, `-audit-python python`
-(`python3` по умолчанию вне Windows), `-audit-reports-dir analysis`.
+Дополнительные флаги: `-audit-agent-dir ../audit-agent` (с готовыми `bin/OS-ARCH/`),
+`-audit-agent-binary /path/to/incident-audit` для локального LLM-клиента,
+`-audit-reports-dir analysis`. Флаг `-audit-python` больше не используется.
 Все эти пути считаются относительно текущего рабочего каталога.
 
 ## Команды без TUI

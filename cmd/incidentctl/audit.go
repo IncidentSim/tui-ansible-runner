@@ -14,23 +14,18 @@ import (
 	"runtime"
 	"strconv"
 
-	"incidentctl/internal/auditrepo"
+	"incidentctl/internal/auditbinary"
 	"incidentctl/internal/config"
 )
 
 type auditOptions struct {
-	AgentDir, Python, LLMConfig, ReportsDir, LLMReportsDir string
+	AgentDir, Binary, LLMConfig, ReportsDir, LLMReportsDir string
 	OnWarning                                              func(string)
-	Source                                                 *auditrepo.Source
 	LLM                                                    *config.LLMConfig
 }
 
 func defaultAuditOptions() auditOptions {
-	python := "python3"
-	if runtime.GOOS == "windows" {
-		python = "python"
-	}
-	return auditOptions{Python: python, ReportsDir: "analysis", LLMReportsDir: "llm-reports"}
+	return auditOptions{ReportsDir: "analysis", LLMReportsDir: "llm-reports"}
 }
 
 type auditClient interface {
@@ -49,7 +44,7 @@ func (e *recordingResumeError) Unwrap() error { return e.Err }
 func auditBundle(root string) ([]byte, error) {
 	var b bytes.Buffer
 	w := tar.NewWriter(&b)
-	for _, name := range []string{"install.py", "src/incident-audit.py", "src/incident_audit_capture.py", "src/incident_audit_compact.py", "config/50-incidentsim.rules", "config/incidentsim-json.conf", "config/incidentsim-audit.sh"} {
+	for _, name := range []string{"bin/linux-amd64/incident-audit"} {
 		path := filepath.Join(root, filepath.FromSlash(name))
 		info, err := os.Lstat(path)
 		if err != nil {
@@ -62,7 +57,7 @@ func auditBundle(root string) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := w.WriteHeader(&tar.Header{Name: name, Mode: 0600, Size: int64(len(data))}); err != nil {
+		if err := w.WriteHeader(&tar.Header{Name: "incident-audit", Mode: 0700, Size: int64(len(data))}); err != nil {
 			return nil, err
 		}
 		if _, err := w.Write(data); err != nil {
@@ -76,19 +71,32 @@ func auditBundle(root string) ([]byte, error) {
 }
 
 func (a auditOptions) prepare(client auditClient, work, name string) error {
-	agentDir, err := a.agentDirectory()
-	if err != nil {
-		return err
+	var bundle []byte
+	var err error
+	if a.AgentDir != "" {
+		bundle, err = auditBundle(a.AgentDir)
+	} else {
+		var binary []byte
+		binary, err = auditbinary.Read("linux", "amd64")
+		if err == nil {
+			var b bytes.Buffer
+			w := tar.NewWriter(&b)
+			err = w.WriteHeader(&tar.Header{Name: "incident-audit", Mode: 0700, Size: int64(len(binary))})
+			if err == nil {
+				_, err = w.Write(binary)
+			}
+			if closeErr := w.Close(); err == nil {
+				err = closeErr
+			}
+			bundle = b.Bytes()
+		}
 	}
-	bundle, err := auditBundle(agentDir)
 	if err != nil {
 		return fmt.Errorf("bundle audit-agent (-audit-agent-dir): %w", err)
 	}
-	// Close an earlier attempt before any provisioning or collector restart.
-	if _, err := client.RunScriptOutput(auditControlScript, work, name, "reset", ""); err != nil {
-		return fmt.Errorf("close previous audit attempt: %w", err)
-	}
-	if err := client.RunShellInput(auditInstallScript, bytes.NewReader(bundle)); err != nil {
+	// The staged Go binary closes an earlier attempt before installation/restart,
+	// including when upgrading an existing Python installation.
+	if err := client.RunShellInput(auditInstallScript, bytes.NewReader(bundle), work, name); err != nil {
 		return fmt.Errorf("install audit-agent: %w", err)
 	}
 	return nil
@@ -177,10 +185,6 @@ func (a auditOptions) analyzeReport(report, name, dir string, output io.Writer) 
 	if err := os.WriteFile(filepath.Join(report, "task.md"), task, 0600); err != nil {
 		return err
 	}
-	agentDir, err := a.agentDirectory()
-	if err != nil {
-		return err
-	}
 	llmConfig, env, cleanup, err := a.analysisSettings()
 	if err != nil {
 		return err
@@ -191,13 +195,22 @@ func (a auditOptions) analyzeReport(report, name, dir string, output io.Writer) 
 		return err
 	}
 	staged := filepath.Join(solution, ".result")
-	cmd := exec.Command(a.Python, filepath.Join(agentDir, "src", "analyze.py"), "--config", llmConfig,
+	binary, binaryCleanup, err := a.analysisExecutable()
+	if err != nil {
+		return err
+	}
+	defer binaryCleanup()
+	cmd := exec.Command(binary, "analyze", "--config", llmConfig,
 		"--input", filepath.Join(report, "llm.json"), "--task", filepath.Join(report, "task.md"),
 		"--validation", filepath.Join(report, "validation.json"), "--output", staged)
 	var summary bytes.Buffer
 	cmd.Env = env
-	cmd.Stdout, cmd.Stderr = &summary, output
+	var diagnostics bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &summary, io.MultiWriter(output, &diagnostics)
 	if err := cmd.Run(); err != nil {
+		if diagnostics.Len() > 0 {
+			return fmt.Errorf("%w: %s", err, diagnostics.String())
+		}
 		return err
 	}
 	for _, filename := range []string{"analysis.md", "analysis.json"} {
@@ -210,6 +223,38 @@ func (a auditOptions) analyzeReport(report, name, dir string, output io.Writer) 
 	}
 	fmt.Fprintf(output, "\nПостмортем LLM готов. Отчёт: %s\n", filepath.Join(solution, "analysis.md"))
 	return nil
+}
+
+func (a auditOptions) analysisExecutable() (string, func(), error) {
+	if a.Binary != "" {
+		return a.Binary, func() {}, nil
+	}
+	if a.AgentDir != "" {
+		name := "incident-audit"
+		if runtime.GOOS == "windows" {
+			name += ".exe"
+		}
+		return filepath.Join(a.AgentDir, "bin", runtime.GOOS+"-"+runtime.GOARCH, name), func() {}, nil
+	}
+	binary, err := auditbinary.Native()
+	if err != nil {
+		return "", nil, err
+	}
+	dir, err := os.MkdirTemp("", "incidentctl-agent-*")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup := func() { _ = os.RemoveAll(dir) }
+	name := "incident-audit"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, binary, 0700); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return path, cleanup, nil
 }
 
 // Mkdir reserves each solution number atomically across CLI processes. Failed
@@ -248,67 +293,16 @@ const auditInstallScript = `set -euo pipefail
 stage="$(mktemp -d)"
 trap 'rm -rf -- "$stage"' EXIT
 tar -xf - -C "$stage" --no-same-owner --no-same-permissions
-if [ "$(id -u)" = 0 ]; then
-  python3 "$stage/install.py"
-else
-  sudo -n python3 "$stage/install.py"
-fi
+chmod 700 "$stage/incident-audit"
+prefix=()
+if [ "$(id -u)" != 0 ]; then prefix=(sudo -n); fi
+"${prefix[@]}" "$stage/incident-audit" control "$1" "$2" reset ""
+"${prefix[@]}" "$stage/incident-audit" install
 `
 
-// Persist the attempt on the VM so separate CLI processes and retries use the same ID.
-// The pointer identifies the current attempt across exercises on this VM.
+// Keep the durable attempt pointer in the separate guest agent.
 const auditControlScript = `set -euo pipefail
 prefix=()
 if [ "$(id -u)" != 0 ]; then prefix=(sudo -n); fi
-"${prefix[@]}" python3 - "$@" <<'PY'
-import fcntl, json, os, subprocess, sys
-from pathlib import Path
-work, name, action, session = sys.argv[1:]
-os.umask(0o077)
-root = Path(work) / '.audit'
-root.mkdir(parents=True, exist_ok=True)
-lock = (root / 'control.lock').open('a')
-fcntl.flock(lock, fcntl.LOCK_EX)
-state_path = root / 'attempt.json'
-state = json.loads(state_path.read_text()) if state_path.exists() else None
-def call(operation, sid):
-    return json.loads(subprocess.check_output(['/usr/local/sbin/incident-audit', operation, '--session-id', sid], text=True))
-def save(value):
-    temporary = root / 'attempt.tmp'
-    temporary.write_text(json.dumps(value))
-    temporary.replace(state_path)
-def stop_previous():
-    if state:
-        # Recover a start whose SSH response was lost. start is idempotent for an active ID.
-        if state.get('starting'):
-            call('start', state['session_id'])
-            state.pop('starting', None)
-            save(state)
-        call('stop', state['session_id'])
-if action == 'reset':
-    stop_previous()
-elif action == 'start':
-    # Save before invoking start, allowing recovery when the SSH reply is lost.
-    stop_previous()
-    state = {'exercise': name, 'session_id': session, 'starting': True}
-    save(state)
-    result = call('start', session)
-    if result['phase'] != 'recording':
-        raise RuntimeError('audit did not enter recording phase')
-    state.pop('starting')
-    save(state)
-elif action == 'stop':
-    if not state or state['exercise'] != name:
-        raise RuntimeError('no audit attempt for this exercise; run infra/start first')
-    stop_previous()
-    result = call('stop', state['session_id'])
-    if result['phase'] != 'stopped':
-        raise RuntimeError('audit did not stop')
-    packet = Path(result['artifacts']['llm']).read_text()
-    if json.loads(packet).get('session') != state['session_id']:
-        raise RuntimeError('audit packet belongs to a different attempt')
-    print(packet)
-else:
-    raise RuntimeError('unknown audit action')
-PY
+"${prefix[@]}" /usr/local/sbin/incident-audit control "$@"
 `

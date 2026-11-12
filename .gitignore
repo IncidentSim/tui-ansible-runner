@@ -6,3 +6,6 @@ incidentctl.json
 /analysis/
 /llm-reports/
 /.cache/
+/internal/auditbinary/binaries/linux-*
+/internal/auditbinary/binaries/windows-*
+/internal/auditbinary/binaries/darwin-*

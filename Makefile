@@ -32,6 +32,7 @@ else
 endif
 
 build:
+	$(GO) generate ./internal/auditbinary
 	$(GO) build -o "$(BINARY)" $(COMMAND)
 
 run: build

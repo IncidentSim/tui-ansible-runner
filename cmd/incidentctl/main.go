@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"incidentctl/internal/auditrepo"
 	"incidentctl/internal/config"
 	"incidentctl/internal/remote"
 	"incidentctl/internal/vm"
@@ -45,8 +44,8 @@ func run(args []string) int {
 	configPath := flags.String("config", "incidentctl.json", "path to the unified incidentctl configuration")
 	vmID := flags.String("vm-id", "", "existing VM ID for non-interactive commands")
 	audit := defaultAuditOptions()
-	flags.StringVar(&audit.AgentDir, "audit-agent-dir", "", "optional local audit-agent override; otherwise download configured Git repository")
-	flags.StringVar(&audit.Python, "audit-python", audit.Python, "local Python interpreter for LLM analysis")
+	flags.StringVar(&audit.AgentDir, "audit-agent-dir", "", "optional audit-agent checkout with prebuilt bin/OS-ARCH executables; otherwise use packaged binaries")
+	flags.StringVar(&audit.Binary, "audit-agent-binary", "", "optional standalone local Go audit-agent executable for LLM analysis")
 	flags.StringVar(&audit.LLMConfig, "audit-llm-config", "", "local LLM configuration; empty saves logs without analysis")
 	flags.StringVar(&audit.ReportsDir, "audit-reports-dir", audit.ReportsDir, "local audit reports directory")
 	flags.Usage = usage
@@ -67,7 +66,6 @@ func run(args []string) int {
 		return fail(configErr)
 	}
 	audit.LLMReportsDir = cfg.Audit.LLMReportsDir
-	audit.Source = &auditrepo.Source{Config: *cfg.Audit.Repository}
 	llmConfigFlagSet := false
 	flags.Visit(func(f *flag.Flag) {
 		if f.Name == "audit-llm-config" {
@@ -193,8 +191,8 @@ Usage:
 Configuration flags:
   -config incidentctl.json
   -vm-id <existing VM ID> (required outside TUI)
-  -audit-agent-dir /optional/local/audit-agent (otherwise Git download)
-  -audit-python python3 (python on Windows)
+  -audit-agent-dir /optional/local/audit-agent (prebuilt bin/OS-ARCH overrides)
+  -audit-agent-binary /path/to/incident-audit
   -audit-llm-config /path/to/llm.local.json
   -audit-reports-dir analysis
 

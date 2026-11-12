@@ -12,16 +12,6 @@ import (
 //go:embed prompts/postmortem.md
 var postmortemPrompt string
 
-func (a auditOptions) agentDirectory() (string, error) {
-	if a.AgentDir != "" {
-		return a.AgentDir, nil
-	}
-	if a.Source == nil {
-		return "", errors.New("audit-agent repository is not configured")
-	}
-	return a.Source.Directory()
-}
-
 func (a auditOptions) llmEnabled() bool {
 	if a.LLM != nil {
 		return a.LLM.Enabled
@@ -29,7 +19,7 @@ func (a auditOptions) llmEnabled() bool {
 	return a.LLMConfig != ""
 }
 
-// The temporary Python profile never contains the API key. Only the local
+// The temporary standalone-agent profile never contains the API key. Only the local
 // analysis child receives it; the SSH client and the guest receive no key.
 func (a auditOptions) analysisSettings() (string, []string, func(), error) {
 	if a.LLM == nil {
@@ -90,8 +80,7 @@ func analysisEnvironment(base []string, key string, direct bool) []string {
 		env = append(env, item)
 	}
 	env = append(env, "INCIDENTCTL_LLM_API_KEY="+key)
-	// Also works with older versions of the downloaded Python client, including
-	// Windows registry proxies. This setting applies only to the local child.
+	// This setting applies only to the local analysis child.
 	if direct {
 		env = append(env, "NO_PROXY=*", "no_proxy=*")
 	}
