@@ -1,0 +1,147 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag, for example v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Validate tag
+        id: tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          printf 'tag=%s\n' "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+      - name: Prepare packaged agent and test
+        run: |
+          go generate ./internal/auditbinary
+          go test ./... -count=1
+          go vet ./...
+      - name: Build all distributions
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: go run ./tools/release -version "$RELEASE_TAG"
+      - name: Keep distribution archives
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-distributions
+          path: dist/${{ steps.tag.outputs.tag }}/*
+          if-no-files-found: error
+          compression-level: 0
+
+  smoke:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux_amd64
+          - runner: windows-2025
+            target: windows_amd64
+          - runner: macos-15-intel
+            target: darwin_amd64
+          - runner: macos-15
+            target: darwin_arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    env:
+      RELEASE_TAG: ${{ needs.build.outputs.tag }}
+      RELEASE_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-distributions
+          path: dist
+      - name: Run Windows distribution
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Expand-Archive -LiteralPath "dist/incidentctl_${env:RELEASE_TAG}_${env:RELEASE_TARGET}.zip" -DestinationPath smoke
+          $binary = (Resolve-Path smoke/incidentctl.exe).Path
+          $savedPath = $env:PATH
+          try {
+            $env:PATH = ''
+            $versionOutput = & $binary --version
+            if ($LASTEXITCODE -ne 0) { throw 'Distribution did not start' }
+            if (($versionOutput -join "`n") -notmatch [regex]::Escape("incidentctl $env:RELEASE_TAG ")) { throw 'Wrong distribution version' }
+            $versionOutput
+          } finally { $env:PATH = $savedPath }
+          & $binary -h
+          if ($LASTEXITCODE -ne 0) { throw 'Distribution help failed' }
+      - name: Run Linux or macOS distribution
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          shasum -a 256 -c SHA256SUMS
+          cd ..
+          mkdir smoke
+          tar -xzf "dist/incidentctl_${RELEASE_TAG}_${RELEASE_TARGET}.tar.gz" -C smoke
+          version_output=$(/usr/bin/env -i PATH= ./smoke/incidentctl --version)
+          printf '%s\n' "$version_output"
+          grep -F "incidentctl $RELEASE_TAG " <<< "$version_output"
+          ./smoke/incidentctl -h
+
+  publish:
+    needs: [build, smoke]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.build.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-distributions
+          path: dist
+      - name: Publish GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c SHA256SUMS
+          cd ..
+          prerelease=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then prerelease=(--prerelease); fi
+          if gh release view "$RELEASE_TAG" --json isDraft > release-state.json 2>/dev/null; then
+            test "$(jq -r .isDraft release-state.json)" = true || { echo 'Release is already published; use a new tag.' >&2; exit 1; }
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+            gh release edit "$RELEASE_TAG" --draft=false "${prerelease[@]}"
+          else
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --title "incidentctl $RELEASE_TAG" --generate-notes "${prerelease[@]}"
+          fi

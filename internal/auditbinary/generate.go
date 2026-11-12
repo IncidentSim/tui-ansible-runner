@@ -5,10 +5,8 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 
 	"incidentctl/internal/auditbuild"
 )
@@ -48,21 +46,9 @@ func run() error {
 		if e != nil {
 			return e
 		}
-		cmd := exec.Command("go", "build", "-trimpath", "-ldflags=-s -w", "-o", output, "./cmd/incident-audit")
-		cmd.Dir = source
-		cmd.Env = []string{}
-		for _, v := range os.Environ() {
-			k, _, _ := strings.Cut(v, "=")
-			if !strings.EqualFold(k, "GOOS") && !strings.EqualFold(k, "GOARCH") && !strings.EqualFold(k, "CGO_ENABLED") && !strings.EqualFold(k, "GOWORK") {
-				cmd.Env = append(cmd.Env, v)
-			}
-		}
-		cmd.Env = append(cmd.Env, "GOOS="+p[0], "GOARCH="+p[1], "CGO_ENABLED=0", "GOWORK=off")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
 		fmt.Println("Building audit-agent", name)
-		if e = cmd.Run(); e != nil {
-			return fmt.Errorf("build audit-agent %s: %w", name, e)
+		if e = auditbuild.Build(source, output, p[0], p[1]); e != nil {
+			return e
 		}
 	}
 	return nil

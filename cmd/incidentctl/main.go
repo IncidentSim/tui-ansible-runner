@@ -43,13 +43,11 @@ func run(args []string) int {
 	if len(args) > 0 && args[0] == "ssh-proxy" {
 		return runSSHProxy(args[1:])
 	}
-	if _, err := remote.ProxyOption(); err != nil {
-		return fail(err)
-	}
 	flags := flag.NewFlagSet("incidentctl", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	configPath := flags.String("config", "incidentctl.json", "path to the unified incidentctl configuration")
 	vmID := flags.String("vm-id", "", "existing VM ID for non-interactive commands")
+	showVersion := flags.Bool("version", false, "print the TUI and bundled audit-agent versions")
 	audit := defaultAuditOptions()
 	flags.StringVar(&audit.AgentDir, "audit-agent-dir", "", "optional audit-agent checkout with prebuilt bin/OS-ARCH executables; otherwise use packaged binaries")
 	flags.StringVar(&audit.Binary, "audit-agent-binary", "", "optional standalone local Go audit-agent executable for LLM analysis")
@@ -62,10 +60,17 @@ func run(args []string) int {
 		}
 		return 2
 	}
+	if *showVersion {
+		fmt.Fprint(os.Stdout, versionText())
+		return 0
+	}
 	rest := flags.Args()
 	if len(rest) > 0 && (rest[0] == "help" || rest[0] == "-h" || rest[0] == "--help") {
 		usage()
 		return 0
+	}
+	if _, err := remote.ProxyOption(); err != nil {
+		return fail(err)
 	}
 
 	cfg, configErr := config.Load(*configPath)
@@ -214,6 +219,7 @@ Usage:
   incidentctl [config flags] record   <exercise>
 
 Configuration flags:
+  --version
   -config incidentctl.json
   -vm-id <existing VM ID> (required outside TUI)
   -audit-agent-dir /optional/local/audit-agent (prebuilt bin/OS-ARCH overrides)

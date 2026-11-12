@@ -4,6 +4,12 @@
 Он готовит окружение, вносит неисправность, записывает действия и проверяет решение.
 Пошаговый запуск: [интеграция audit-agent](docs/audit-integration.md).
 
+Готовое приложение: скачайте архив для своей ОС из
+[GitHub Releases](https://github.com/IncidentSim/tui-ansible-runner/releases)
+и следуйте **пользовательскому README внутри архива**.
+Его исходник находится в [distribution/README.md](distribution/README.md).
+Ниже описаны архитектура и сборка из исходников.
+
 ## Как это устроено
 
 ```mermaid
@@ -78,10 +84,22 @@ flowchart TB
 
 ## Настройка
 
+### Сборка из исходников
+
+Linux/macOS:
+
 ```bash
 cp incidentctl.example.json incidentctl.json
 go generate ./internal/auditbinary
 go build -o bin/incidentctl ./cmd/incidentctl
+```
+
+Windows, PowerShell:
+
+```powershell
+Copy-Item incidentctl.example.json incidentctl.json
+go generate ./internal/auditbinary
+go build -o bin/incidentctl.exe ./cmd/incidentctl
 ```
 
 Те же действия доступны через `Makefile`:
@@ -93,6 +111,19 @@ make run      # собрать и запустить TUI
 make test
 make check    # форматирование, тесты, vet и сборка
 ```
+
+Для сборки пользовательских архивов под все поддерживаемые ОС:
+
+```bash
+make release VERSION=v0.1.0
+# Без Make:
+go run ./tools/release -version v0.1.0
+```
+
+Архивы появятся в `dist/v0.1.0/`. В них включается отдельный пользовательский
+README, а LLM в примере конфигурации выключен. Отправка тега `v*` запускает
+автоматическую сборку, проверки и публикацию в GitHub Releases.
+Подробнее: [сборка и публикация релизов](docs/releases.md).
 
 Для постмортема LLM укажите в `incidentctl.json` `audit.llm.enabled: true`
 и DeepSeek-ключ в `audit.llm.api_key` либо переменной `DEEPSEEK_API_KEY`.
@@ -201,7 +232,7 @@ SSH-данным и запускает playbook. При выходе из TUI к
 API. При запуске он получает указанный `ref` в каталог кеша, затем читает
 упражнения из `subdirectory`.
 
-Шаблон уже настроен на `git@github.com:IncidentSim/exersice.git`, ветку `master`
+Шаблон уже настроен на `https://github.com/IncidentSim/exersice.git`, ветку `master`
 и корень репозитория. Формат репозитория описан в `exersice/README.md`.
 
 Чтобы опубликовать изменения каталога из отдельного checkout:

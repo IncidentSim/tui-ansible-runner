@@ -11,13 +11,15 @@ RUN_BINARY = $(BINARY)
 endif
 CONFIG ?= incidentctl.json
 COMMAND := ./cmd/incidentctl
+VERSION ?=
 
-.PHONY: help config audit-binaries build run test vet fmt check clean
+.PHONY: help config audit-binaries build run release test vet fmt check clean
 
 help:
 	@echo make config             create incidentctl.json from the example
 	@echo make build              build the incidentctl binary
 	@echo make run                build and start the TUI
+	@echo make release VERSION=v0.1.0  build user distribution archives
 	@echo make test               run Go tests
 	@echo make vet                run go vet
 	@echo make fmt                format Go sources
@@ -39,6 +41,9 @@ build: audit-binaries
 
 run: build
 	"$(RUN_BINARY)" -config "$(CONFIG)" $(ARGS)
+
+release:
+	$(GO) run ./tools/release -version "$(VERSION)"
 
 test: audit-binaries
 	$(GO) test ./...

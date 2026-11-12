@@ -1,20 +1,14 @@
 {
   "exercise_repository": {
-    "repository": "git@github.com:IncidentSim/exersice.git",
+    "repository": "https://github.com/IncidentSim/exersice.git",
     "ref": "master",
     "subdirectory": ".",
     "cache_dir": "~/.cache/incidentctl/exercises"
   },
   "audit": {
     "llm_reports_dir": "llm-reports",
-    "repository": {
-      "repository": "git@github.com:IncidentSim/audit-agent.git",
-      "ref": "main",
-      "subdirectory": ".",
-      "cache_dir": "~/.cache/incidentctl/audit-agent"
-    },
     "llm": {
-      "enabled": true,
+      "enabled": false,
       "api_key": "",
       "api_key_env": "DEEPSEEK_API_KEY",
       "base_url": "https://api.deepseek.com",
