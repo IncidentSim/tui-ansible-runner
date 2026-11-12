@@ -120,6 +120,7 @@ type solutionRun struct {
 	client        *remote.Client
 	output        bytes.Buffer
 	terminalURL   string
+	openBrowser   func(string) error
 	audit         auditOptions
 }
 
@@ -284,9 +285,16 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if errors.Is(msg.err, vm.ErrTokenExpired) {
 				m.status = tokenExpiredMessage
+			} else if msg.stage == solutionOpenTerminal {
+				m.status = "Ошибка: " + msg.err.Error() + ". Нажмите p для повтора или o для SSH."
+				if errors.Is(msg.err, vm.ErrBrowserPending) {
+					m.status = "Веб-терминал Nexterm пока не готов. VM и запись действий готовы. Нажмите p для повтора или o для SSH."
+				} else if errors.Is(msg.err, vm.ErrBrowserUnsupported) {
+					m.status = "Веб-терминал недоступен для SSH-ключа этой VM. Нажмите o для SSH."
+				}
 			} else if msg.stage == solutionVerifyIncident && isSSHTransportFailure(msg.err) {
 				m.status = "Ошибка SSH: потеряна связь с VM " + msg.run.instance.ID + ". Нажмите p, чтобы повторить проверку инцидента на той же VM."
-			} else if msg.stage == solutionCheckCapabilities || msg.stage == solutionCreateVM || msg.stage == solutionConnectSSH || msg.stage == solutionOpenTerminal {
+			} else if msg.stage == solutionCheckCapabilities || msg.stage == solutionCreateVM || msg.stage == solutionConnectSSH {
 				m.status = serverBusyMessage
 			} else {
 				m.status = "Ошибка: " + msg.err.Error()
@@ -466,6 +474,9 @@ func (m tuiModel) updateKey(key string) (tea.Model, tea.Cmd) {
 		case "v":
 			return m.verifySolution()
 		case "p":
+			if m.solutionFailed && m.solutionFailure == solutionOpenTerminal && m.solution != nil {
+				return m.retryWebTerminal()
+			}
 			if m.solutionFailed && m.solutionFailure == solutionVerifyIncident && m.solution != nil {
 				return m.retryIncidentCheck()
 			}
@@ -741,17 +752,36 @@ func (r *solutionRun) verifyIncidentCmd() tea.Cmd {
 
 func (r *solutionRun) openTerminalCmd() tea.Cmd {
 	return func() tea.Msg {
-		terminalURL, err := r.provider.TerminalURL(context.Background(), r.instance.ID)
-		if err == nil {
+		fmt.Fprintf(&r.output, "\n━━ Открытие веб-терминала · VM %s ━━\n", r.instance.ID)
+		if r.terminalURL == "" {
+			terminalURL, err := r.provider.TerminalURL(context.Background(), r.instance.ID)
+			if err != nil {
+				err = fmt.Errorf("получение веб-терминала через VM API: %w", err)
+				fmt.Fprintln(&r.output, "Ошибка:", err)
+				return solutionStageResult{run: r, stage: solutionOpenTerminal, err: err}
+			}
 			r.terminalURL = terminalURL
-			err = openBrowserURL(terminalURL)
 		}
-		if err != nil {
-			return solutionStageResult{run: r, stage: solutionOpenTerminal, err: fmt.Errorf("не удалось открыть веб-терминал: %w", err)}
+		fmt.Fprintln(&r.output, "Ссылка веб-терминала получена. Запускаю браузер.")
+		open := r.openBrowser
+		if open == nil {
+			open = openBrowserURL
 		}
-		fmt.Fprintf(&r.output, "\nVM ID: %s\nВеб-терминал открыт: %s\n", r.instance.ID, terminalURL)
+		if err := open(r.terminalURL); err != nil {
+			err = fmt.Errorf("запуск браузера: %w", err)
+			fmt.Fprintln(&r.output, "Ошибка:", err)
+			return solutionStageResult{run: r, stage: solutionOpenTerminal, err: err}
+		}
+		fmt.Fprintln(&r.output, "Веб-терминал открыт.")
 		return solutionStageResult{run: r, stage: solutionOpenTerminal}
 	}
+}
+
+func (m tuiModel) retryWebTerminal() (tea.Model, tea.Cmd) {
+	m.busy, m.solutionFailed = true, false
+	m.solutionDone[solutionOpenTerminal] = false
+	m.startSolutionStage(solutionOpenTerminal, "Повторно открываю веб-терминал на той же VM…")
+	return m, tea.Batch(m.solution.openTerminalCmd(), spinnerTickCmd())
 }
 
 func (m *tuiModel) adoptSolutionConnection(run *solutionRun) {
@@ -828,6 +858,9 @@ func (m tuiModel) openSSH() (tea.Model, tea.Cmd) {
 
 func sshCommand(target vm.Connection) string {
 	args := []string{"ssh", "-p", strconv.Itoa(target.Port), "-o", "BatchMode=yes"}
+	if proxy, err := remote.ProxyOption(); err == nil && proxy != "" {
+		args = append(args, "-o", proxy)
+	}
 	if target.IdentityFile != "" {
 		args = append(args, "-i", target.IdentityFile)
 	}
@@ -839,10 +872,7 @@ func sshCommand(target vm.Connection) string {
 		strict = "yes"
 	}
 	args = append(args, "-o", "StrictHostKeyChecking="+strict, target.User+"@"+target.Host)
-	for i := range args {
-		args[i] = localShellQuote(args[i])
-	}
-	return strings.Join(args, " ")
+	return localSSHCommand(args)
 }
 
 func localShellQuote(value string) string {
@@ -883,7 +913,7 @@ func openSSHTerminal(target vm.Connection) error {
 		}
 		return errors.New("не найден поддерживаемый эмулятор терминала")
 	case "windows":
-		return exec.Command("cmd", "/c", "start", "", "cmd", "/k", command).Run()
+		return exec.Command("cmd", "/c", "start", "", "powershell", "-NoExit", "-Command", command).Run()
 	default:
 		return fmt.Errorf("открытие нового терминала не поддерживается на %s", runtime.GOOS)
 	}
@@ -1028,6 +1058,9 @@ func (m tuiModel) viewSolution(width int) string {
 	content += mutedStyle.Render("d описание   t подсказки   v проверить   a токен   x выйти из решения   q выйти")
 	if m.solutionFailed && m.solutionFailure == solutionVerifyIncident {
 		content += "\n" + mutedStyle.Render("p повторить проверку инцидента на той же VM")
+	}
+	if m.solutionFailed && m.solutionFailure == solutionOpenTerminal {
+		content += "\n" + mutedStyle.Render("p повторить открытие веб-терминала   o открыть SSH-терминал   c команда SSH")
 	}
 	return panelStyle.Width(max(30, width-4)).Render(content)
 }

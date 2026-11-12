@@ -118,6 +118,64 @@ func TestMicroVMServiceProviderReportsUnauthorizedToken(t *testing.T) {
 	}
 }
 
+func TestTerminalFailureIncludesVMOperationAndCode(t *testing.T) {
+	provider := NewMicroVMServiceProviderWithCredentials(config.MicroVMServiceConfig{BaseURL: "https://service.example", TimeoutSeconds: 2}, "device", "token")
+	provider.httpClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodPost {
+			return jsonResponse(http.StatusAccepted, `{"operation_id":"terminal-op"}`), nil
+		}
+		return jsonResponse(http.StatusOK, `{"status":"failed","error":{"code":"unavailable","message":"operation not confirmed"}}`), nil
+	})}
+	_, err := provider.TerminalURL(context.Background(), "existing-vm")
+	if err == nil {
+		t.Fatal("expected terminal failure")
+	}
+	for _, value := range []string{"terminal-op", "existing-vm", "unavailable", "operation not confirmed"} {
+		if !strings.Contains(err.Error(), value) {
+			t.Fatalf("missing %q in %v", value, err)
+		}
+	}
+}
+
+func TestTerminalPendingResumesSameOperationUntilBrowserReady(t *testing.T) {
+	posts, polls := 0, 0
+	provider := NewMicroVMServiceProviderWithCredentials(config.MicroVMServiceConfig{BaseURL: "https://service.example", TimeoutSeconds: 2}, "device", "token")
+	provider.httpClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodPost {
+			posts++
+			return jsonResponse(http.StatusAccepted, `{"operation_id":"terminal-op"}`), nil
+		}
+		if request.URL.Path != "/v1/operations/terminal-op" {
+			t.Fatalf("wrong operation: %s", request.URL.Path)
+		}
+		polls++
+		if polls == 1 {
+			return jsonResponse(http.StatusOK, `{"status":"succeeded","result":{"browser_status":"pending"}}`), nil
+		}
+		return jsonResponse(http.StatusOK, `{"status":"succeeded","result":{"browser_status":"ready","url":"https://terminal.example/servers?token=private-session"}}`), nil
+	})}
+	if _, err := provider.TerminalURL(context.Background(), "existing-vm"); !errors.Is(err, ErrBrowserPending) {
+		t.Fatalf("expected browser pending, got %v", err)
+	}
+	url, err := provider.TerminalURL(context.Background(), "existing-vm")
+	if err != nil || url != "https://terminal.example/servers?token=private-session" || posts != 1 || polls != 2 {
+		t.Fatalf("resume: url %q, error %v, POSTs %d, polls %d", url, err, posts, polls)
+	}
+}
+
+func TestTerminalUnsupportedIsExplicit(t *testing.T) {
+	provider := NewMicroVMServiceProviderWithCredentials(config.MicroVMServiceConfig{BaseURL: "https://service.example", TimeoutSeconds: 2}, "device", "token")
+	provider.httpClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodPost {
+			return jsonResponse(http.StatusAccepted, `{"operation_id":"terminal-op"}`), nil
+		}
+		return jsonResponse(http.StatusOK, `{"status":"succeeded","result":{"browser_status":"unsupported"}}`), nil
+	})}
+	if _, err := provider.TerminalURL(context.Background(), "existing-vm"); !errors.Is(err, ErrBrowserUnsupported) {
+		t.Fatalf("expected unsupported browser, got %v", err)
+	}
+}
+
 func TestMicroVMServiceProviderCleansUpAllVMs(t *testing.T) {
 	var deleted []string
 	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {

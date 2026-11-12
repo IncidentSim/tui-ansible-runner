@@ -85,6 +85,7 @@ func (c *Client) scriptCommand(args ...string) string {
 }
 
 func (c *Client) command(remoteCommand string) *exec.Cmd {
+	proxy, proxyErr := ProxyOption()
 	args := []string{
 		"-p", strconv.Itoa(c.config.Port),
 		"-o", "BatchMode=yes",
@@ -96,6 +97,12 @@ func (c *Client) command(remoteCommand string) *exec.Cmd {
 	if c.config.IdentityFile != "" {
 		args = append(args, "-i", c.config.IdentityFile)
 	}
+	if proxy != "" {
+		args = append(args, "-o", proxy)
+		if c.config.Bastion != nil {
+			proxyErr = errors.New("SSH proxy cannot be combined with a bastion")
+		}
+	}
 	if c.config.Bastion != nil && c.config.Bastion.Host != "" && c.config.Bastion.Port > 0 && c.config.Bastion.User != "" {
 		args = append(args, "-J", fmt.Sprintf("%s@%s:%d", c.config.Bastion.User, c.config.Bastion.Host, c.config.Bastion.Port))
 	}
@@ -105,7 +112,11 @@ func (c *Client) command(remoteCommand string) *exec.Cmd {
 		args = append(args, "-o", "StrictHostKeyChecking=accept-new")
 	}
 	args = append(args, c.config.User+"@"+c.config.Host, remoteCommand)
-	return exec.Command("ssh", args...)
+	cmd := exec.Command("ssh", args...)
+	if proxyErr != nil {
+		cmd.Err = proxyErr
+	}
+	return cmd
 }
 
 func joinCommand(parts []string) string {

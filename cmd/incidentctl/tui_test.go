@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -43,7 +44,11 @@ func TestSSHCommandIncludesConnectionSettings(t *testing.T) {
 		IdentityFile:          "/tmp/key with space",
 		StrictHostKeyChecking: true,
 	})
-	for _, part := range []string{"ssh", "-p 2222", "'/tmp/key with space'", "StrictHostKeyChecking=yes", "root@vm.example"} {
+	keyArgument := "'/tmp/key with space'"
+	if runtime.GOOS == "windows" {
+		keyArgument = `"/tmp/key with space"`
+	}
+	for _, part := range []string{"ssh", "-p 2222", keyArgument, "StrictHostKeyChecking=yes", "root@vm.example"} {
 		if !strings.Contains(command, part) {
 			t.Fatalf("ssh command %q does not contain %q", command, part)
 		}

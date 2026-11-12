@@ -14,6 +14,7 @@ import (
 
 	"incidentctl/internal/config"
 	"incidentctl/internal/remote"
+	"incidentctl/internal/sshproxy"
 	"incidentctl/internal/vm"
 )
 
@@ -39,6 +40,12 @@ func main() {
 }
 
 func run(args []string) int {
+	if len(args) > 0 && args[0] == "ssh-proxy" {
+		return runSSHProxy(args[1:])
+	}
+	if _, err := remote.ProxyOption(); err != nil {
+		return fail(err)
+	}
 	flags := flag.NewFlagSet("incidentctl", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	configPath := flags.String("config", "incidentctl.json", "path to the unified incidentctl configuration")
@@ -171,6 +178,24 @@ func run(args []string) int {
 		return fail(fmt.Errorf("unknown command %q", command))
 	}
 	if err != nil {
+		return fail(err)
+	}
+	return 0
+}
+
+func runSSHProxy(args []string) int {
+	flags := flag.NewFlagSet("ssh-proxy", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	proxy := flags.String("url", "", "HTTP CONNECT or SOCKS5 proxy URL")
+	host := flags.String("host", "", "SSH destination")
+	port := flags.Int("port", 0, "SSH destination port")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 0 {
+		return fail(errors.New("unexpected ssh-proxy arguments"))
+	}
+	if err := sshproxy.Relay(context.Background(), *proxy, *host, *port, os.Stdin, os.Stdout); err != nil {
 		return fail(err)
 	}
 	return 0

@@ -19,8 +19,10 @@ import (
 )
 
 var (
-	ErrTokenRequired = errors.New("token is required")
-	ErrTokenExpired  = errors.New("token expired")
+	ErrTokenRequired      = errors.New("token is required")
+	ErrTokenExpired       = errors.New("token expired")
+	ErrBrowserPending     = errors.New("Nexterm browser terminal is pending; SSH remains available")
+	ErrBrowserUnsupported = errors.New("browser terminal is unsupported for this VM's SSH key; use SSH")
 )
 
 type APIError struct {
@@ -58,10 +60,11 @@ type MicroVMServiceProvider struct {
 	config config.MicroVMServiceConfig
 	userID string
 
-	mu           sync.RWMutex
-	token        string
-	capabilities Capabilities
-	httpClient   *http.Client
+	mu                 sync.RWMutex
+	token              string
+	capabilities       Capabilities
+	httpClient         *http.Client
+	terminalOperations map[string]string
 }
 
 func NewMicroVMServiceProvider(cfg config.MicroVMServiceConfig) *MicroVMServiceProvider {
@@ -85,6 +88,7 @@ func (p *MicroVMServiceProvider) UserID() string {
 func (p *MicroVMServiceProvider) SetToken(token string) {
 	p.mu.Lock()
 	p.token = strings.TrimSpace(token)
+	p.terminalOperations = nil
 	p.mu.Unlock()
 }
 
@@ -182,14 +186,35 @@ func (p *MicroVMServiceProvider) TerminalURL(ctx context.Context, vmID string) (
 	if strings.TrimSpace(vmID) == "" {
 		return "", errors.New("VM id is required")
 	}
-	var started terminalResponse
-	path := "/v1/vms/" + url.PathEscape(vmID) + "/terminal"
-	if err := p.doJSON(ctx, http.MethodPost, path, map[string]any{}, &started, newIdempotencyKey()); err != nil {
-		return "", err
+	p.mu.RLock()
+	operationID := p.terminalOperations[vmID]
+	p.mu.RUnlock()
+	if operationID == "" {
+		var started terminalResponse
+		path := "/v1/vms/" + url.PathEscape(vmID) + "/terminal"
+		if err := p.doJSON(ctx, http.MethodPost, path, map[string]any{}, &started, newIdempotencyKey()); err != nil {
+			return "", fmt.Errorf("request web terminal for VM %s: %w", vmID, err)
+		}
+		operationID = started.OperationID
 	}
-	operation, err := p.waitOperation(ctx, started.OperationID)
+	operation, err := p.waitOperation(ctx, operationID)
+	p.mu.Lock()
+	delete(p.terminalOperations, vmID)
+	if err == nil && operation.Result.BrowserStatus == "pending" {
+		if p.terminalOperations == nil {
+			p.terminalOperations = make(map[string]string)
+		}
+		p.terminalOperations[vmID] = operationID
+	}
+	p.mu.Unlock()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("web terminal operation %s for VM %s: %w", operationID, vmID, err)
+	}
+	if operation.Result.BrowserStatus == "pending" {
+		return "", fmt.Errorf("VM %s, operation %s: %w", vmID, operationID, ErrBrowserPending)
+	}
+	if operation.Result.BrowserStatus == "unsupported" {
+		return "", fmt.Errorf("VM %s: %w", vmID, ErrBrowserUnsupported)
 	}
 	if operation.Result.URL == "" {
 		return "", errors.New("VM service did not return terminal URL")
@@ -318,7 +343,8 @@ type operationResponse struct {
 	Status string `json:"status"`
 	VMID   string `json:"vm_id"`
 	Result struct {
-		URL string `json:"url"`
+		URL           string `json:"url"`
+		BrowserStatus string `json:"browser_status"`
 	} `json:"result"`
 	Error struct {
 		Code    string `json:"code"`
@@ -346,7 +372,7 @@ func (p *MicroVMServiceProvider) waitOperation(ctx context.Context, operationID 
 			if message == "" {
 				message = "VM operation failed"
 			}
-			return operationResponse{}, errors.New(message)
+			return operationResponse{}, fmt.Errorf("VM operation %s failed (code %s): %s", operationID, operation.Error.Code, message)
 		}
 		select {
 		case <-waitCtx.Done():

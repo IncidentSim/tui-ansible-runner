@@ -69,6 +69,35 @@ Python на компьютере пользователя не нужен. До�
 Поля `audit.repository` сохранены для совместимости конфигурации.
 После настройки достаточно `make run`.
 
+### SSH через прокси
+
+Для SSH к VM задайте отдельную переменную `INCIDENTCTL_SSH_PROXY`.
+Например, если локальный HTTP-прокси работает на порту 10809:
+
+```powershell
+$env:HTTPS_PROXY = "http://127.0.0.1:10809"
+$env:INCIDENTCTL_SSH_PROXY = $env:HTTPS_PROXY
+make run
+```
+
+Linux/macOS:
+
+```bash
+export HTTPS_PROXY=http://127.0.0.1:10809
+export INCIDENTCTL_SSH_PROXY="$HTTPS_PROXY"
+make run
+```
+
+Поддерживаются HTTP CONNECT (`http://`, `https://`) и SOCKS5 (`socks5://`,
+`socks5h://`), без авторизации на прокси. Для SOCKS5 имя VM разрешает прокси.
+TUI использует собственный встроенный `ssh-proxy` через OpenSSH `ProxyCommand`;
+дополнительные `nc`, `ncat` и `connect.exe` не требуются. Прокси применяется
+к подготовке Ansible, загрузке файлов, установке агента и остальным SSH-командам,
+включая открытие отдельного SSH-терминала. Совместное использование с bastion
+не поддерживается. `HTTPS_PROXY` сам по себе влияет на HTTP API, но не включает
+SSH-прокси. Для прямого SSH удалите `INCIDENTCTL_SSH_PROXY` или задайте `direct`.
+Прокси должен разрешать TCP-соединения на SSH-порт VM (например, 22000).
+
 Дополнительные аргументы CLI можно передать через `ARGS`, например:
 
 ```bash
