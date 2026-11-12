@@ -1,6 +1,7 @@
 package remote
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -119,7 +120,14 @@ func printSSHFailure(writer io.Writer, log string) {
 }
 
 func (c *Client) run(command string, input func() (io.Reader, error), output io.Writer) error {
+	return c.runContext(context.Background(), command, input, output)
+}
+
+func (c *Client) runContext(ctx context.Context, command string, input func() (io.Reader, error), output io.Writer) error {
 	for attempt := 1; attempt <= sshAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		file, err := os.CreateTemp("", "incidentctl-ssh-*.log")
 		if err != nil {
 			return fmt.Errorf("create SSH diagnostics: %w", err)
@@ -134,7 +142,7 @@ func (c *Client) run(command string, input func() (io.Reader, error), output io.
 			os.Remove(name)
 			return err
 		}
-		cmd := c.command(command)
+		cmd := c.commandContext(ctx, command)
 		cmd.Args = append([]string{cmd.Args[0], "-v", "-E", name, "-o", "LogLevel=DEBUG1"}, cmd.Args[1:]...)
 		if c.attemptCommand != nil {
 			cmd = c.attemptCommand(command, name)
@@ -142,7 +150,7 @@ func (c *Client) run(command string, input func() (io.Reader, error), output io.
 		counter := &outputCounter{writer: output}
 		var helperErrors diagnosticTail
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = reader, counter, io.MultiWriter(c.errOut, &helperErrors)
-		err = describe(cmd.Run())
+		err = describe(ctx, cmd.Run())
 		log, complete := readSSHLog(name)
 		os.Remove(name)
 		if err == nil {
@@ -165,7 +173,17 @@ func (c *Client) run(command string, input func() (io.Reader, error), output io.
 		if pause == nil {
 			pause = time.Sleep
 		}
-		pause(time.Duration(attempt) * time.Second)
+		if c.retrySleep != nil {
+			pause(time.Duration(attempt) * time.Second)
+		} else {
+			timer := time.NewTimer(time.Duration(attempt) * time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
 	}
 	panic("unreachable SSH retry state")
 }
