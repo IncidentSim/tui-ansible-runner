@@ -20,6 +20,7 @@ import (
 	"incidentctl/internal/exercises"
 	"incidentctl/internal/identity"
 	"incidentctl/internal/remote"
+	"incidentctl/internal/verifier"
 	"incidentctl/internal/vm"
 	"incidentctl/internal/vmstate"
 )
@@ -768,14 +769,16 @@ func (r *solutionRun) applyPlaybookCmd(stage solutionStage, title, playbook stri
 func (r *solutionRun) verifyIncidentCmd() tea.Cmd {
 	return func() tea.Msg {
 		fmt.Fprintln(&r.output, "\n━━ Проверка воспроизведения инцидента ━━")
-		err := runPlaybook(r.client, r.remoteWorkDir, r.item.exercise, r.item.dir, r.item.exercise.Playbooks.Verification, nil)
+		// Same engine as final verification: only an explicit failed check proves
+		// the incident; technical errors never do.
+		_, err := verifyExercise(context.Background(), r.client, r.remoteWorkDir, r.item.exercise, r.item.dir, nil, &r.output)
 		if err == nil {
 			return solutionStageResult{run: r, stage: solutionVerifyIncident, err: errors.New("verification неожиданно прошла после внесения инцидента")}
 		}
 		if !isExpectedVerificationFailure(err) {
 			return solutionStageResult{run: r, stage: solutionVerifyIncident, err: fmt.Errorf("не удалось подтвердить ошибку инфраструктуры: %w", err)}
 		}
-		fmt.Fprintln(&r.output, "verification завершилась с ненулевым кодом — ожидаемый результат.")
+		fmt.Fprintln(&r.output, "verification обнаружила неисправность — ожидаемый результат.")
 		return solutionStageResult{run: r, stage: solutionVerifyIncident}
 	}
 }
@@ -833,6 +836,12 @@ func (m *tuiModel) releaseSSH() {
 }
 
 func isExpectedVerificationFailure(err error) bool {
+	if isVerdict(err) {
+		return true
+	}
+	if isTechnicalVerification(err) {
+		return false
+	}
 	var runErr *playbookRunError
 	var commandErr *remote.CommandError
 	// OpenSSH reserves 255 for connection/authentication failures. Those must
@@ -853,8 +862,8 @@ func (m tuiModel) verifySolution() (tea.Model, tea.Cmd) {
 		client := remote.NewWithWriters(connection, &output, &output)
 		var warning string
 		audit.OnWarning = func(message string) { warning = message }
-		err := audit.verify(client, remoteWorkDir, item.exercise.Name, item.dir, &output, func(out io.Writer) error {
-			return runPlaybook(remote.NewWithWriters(connection, out, out), remoteWorkDir, item.exercise, item.dir, item.exercise.Playbooks.Verification, nil)
+		err := audit.verifyResult(client, remoteWorkDir, item.exercise.Name, item.dir, &output, func(out io.Writer) (*verifier.Result, error) {
+			return verifyExercise(context.Background(), remote.NewWithWriters(connection, out, out), remoteWorkDir, item.exercise, item.dir, nil, out)
 		})
 		return operationResult{kind: operationVerify, output: output.String(), warning: warning, err: err}
 	}
@@ -865,6 +874,12 @@ func (m tuiModel) verifySolution() (tea.Model, tea.Cmd) {
 func isRejectedVerification(err error) bool {
 	var resumeErr *recordingResumeError
 	if errors.As(err, &resumeErr) {
+		return false
+	}
+	if isVerdict(err) {
+		return true
+	}
+	if isTechnicalVerification(err) {
 		return false
 	}
 	var runErr *playbookRunError

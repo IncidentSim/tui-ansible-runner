@@ -16,6 +16,7 @@ import (
 
 	"incidentctl/internal/auditbinary"
 	"incidentctl/internal/config"
+	"incidentctl/internal/verifier"
 )
 
 type auditOptions struct {
@@ -113,6 +114,12 @@ func (a auditOptions) start(client auditClient, work, name string) error {
 
 // stop is deliberately before the callback: even exercise upload must not enter the recording.
 func (a auditOptions) verify(client auditClient, work, name, dir string, output io.Writer, validate func(io.Writer) error) error {
+	return a.verifyResult(client, work, name, dir, output, func(out io.Writer) (*verifier.Result, error) { return nil, validate(out) })
+}
+
+// verifyResult is verify for validators that return a structured report. The
+// validated report is persisted next to the audit packet for the postmortem.
+func (a auditOptions) verifyResult(client auditClient, work, name, dir string, output io.Writer, validate func(io.Writer) (*verifier.Result, error)) error {
 	packet, err := client.RunScriptOutput(auditControlScript, work, name, "stop", "")
 	if err != nil {
 		return fmt.Errorf("stop audit recording; verification blocked: %w", err)
@@ -134,7 +141,16 @@ func (a auditOptions) verify(client auditClient, work, name, dir string, output 
 		return err
 	}
 	var validation bytes.Buffer
-	verifyErr := validate(io.MultiWriter(output, &validation))
+	verifyResult, verifyErr := validate(io.MultiWriter(output, &validation))
+	if verifyResult == nil {
+		var rejected *verifier.RejectedError
+		var technical *verifier.TechnicalError
+		if errors.As(verifyErr, &rejected) {
+			verifyResult = rejected.Result
+		} else if errors.As(verifyErr, &technical) {
+			verifyResult = technical.Result
+		}
+	}
 	// Reopen recording immediately after Ansible, before saving reports or waiting
 	// for the LLM. Each recording gets a new ID; the sealed packet stays unchanged.
 	var resumeErr error
@@ -145,16 +161,23 @@ func (a auditOptions) verify(client auditClient, work, name, dir string, output 
 		fmt.Fprintln(output, "\nЗапись пользовательских событий включена автоматически.")
 	}
 	result := struct {
-		Passed bool   `json:"passed"`
-		Error  string `json:"error,omitempty"`
-		Output string `json:"output"`
+		Passed bool            `json:"passed"`
+		Error  string          `json:"error,omitempty"`
+		Output string          `json:"output"`
+		Status string          `json:"status,omitempty"`
+		Report json.RawMessage `json:"report,omitempty"`
 	}{Passed: verifyErr == nil, Output: validation.String()}
 	if verifyErr != nil {
 		result.Error = verifyErr.Error()
 	}
+	var reportErr error
+	if verifyResult != nil && len(verifyResult.Raw) > 0 {
+		result.Status, result.Report = string(verifyResult.Report.Status), json.RawMessage(verifyResult.Raw)
+		reportErr = writeFileAtomic(filepath.Join(report, "verification-report.json"), append(append([]byte(nil), verifyResult.Raw...), '\n'))
+	}
 	data, err := json.MarshalIndent(result, "", "  ")
 	if err == nil {
-		err = os.WriteFile(filepath.Join(report, "validation.json"), data, 0600)
+		err = errors.Join(reportErr, writeFileAtomic(filepath.Join(report, "validation.json"), data))
 	}
 	if err != nil {
 		return errors.Join(verifyErr, resumeErr, err)
@@ -175,6 +198,28 @@ func (a auditOptions) verify(client auditClient, work, name, dir string, output 
 		return errors.Join(verifyErr, resumeErr)
 	}
 	return verifyErr
+}
+
+// writeFileAtomic writes a private file via a temporary name and rename, so a
+// reader never observes a partial report.
+func writeFileAtomic(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-"+filepath.Base(path)+"-")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 func (a auditOptions) analyzeReport(report, name, dir string, output io.Writer) error {

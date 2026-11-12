@@ -15,6 +15,7 @@ import (
 	"incidentctl/internal/config"
 	"incidentctl/internal/remote"
 	"incidentctl/internal/sshproxy"
+	"incidentctl/internal/verifier"
 	"incidentctl/internal/vm"
 )
 
@@ -162,8 +163,8 @@ func run(args []string) int {
 		}
 		client := remote.New(connection)
 		if command == "verify" {
-			err = audit.verify(client, remoteWorkDir, item.Exercise.Name, item.Dir, os.Stdout, func(out io.Writer) error {
-				return runPlaybook(remote.NewWithWriters(connection, out, out), remoteWorkDir, item.Exercise, item.Dir, playbook, extra)
+			err = audit.verifyResult(client, remoteWorkDir, item.Exercise.Name, item.Dir, os.Stdout, func(out io.Writer) (*verifier.Result, error) {
+				return verifyExercise(ctx, remote.NewWithWriters(connection, out, out), remoteWorkDir, item.Exercise, item.Dir, extra, out)
 			})
 		} else if err = audit.prepare(client, remoteWorkDir, item.Exercise.Name); err == nil {
 			if err = preparePlaybookHost(client, item.Exercise); err == nil {
@@ -271,7 +272,7 @@ func selectPlaybook(exercise config.Exercise, command string) (string, error) {
 	}
 }
 
-func runPlaybook(client *remote.Client, remoteWorkDir string, exercise config.Exercise, dir, playbook string, extra []string) error {
+func runPlaybook(client playbookClient, remoteWorkDir string, exercise config.Exercise, dir, playbook string, extra []string) error {
 	archive, err := makeArchive(dir)
 	if err != nil {
 		return err
