@@ -28,10 +28,10 @@ func TestIsCommandError(t *testing.T) {
 	}
 }
 
-func TestSSHRetriesConnectionsWithoutRepeatingRemoteCommand(t *testing.T) {
+func TestSSHCommandUsesSingleTimedConnectionAttempt(t *testing.T) {
 	cmd := New(vm.Connection{Host: "vm.example", User: "root", Port: 22000}).command("run-once")
 	args := strings.Join(cmd.Args, " ")
-	for _, option := range []string{"ConnectTimeout=10", "ConnectionAttempts=3", "ServerAliveInterval=15", "ServerAliveCountMax=2"} {
+	for _, option := range []string{"ConnectTimeout=30", "ConnectionAttempts=1", "ServerAliveInterval=15", "ServerAliveCountMax=2"} {
 		if !strings.Contains(args, option) {
 			t.Fatalf("missing %s: %s", option, args)
 		}

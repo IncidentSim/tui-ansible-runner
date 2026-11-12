@@ -161,6 +161,7 @@ type tuiModel struct {
 	solutionDone      [solutionStageCount]bool
 	solutionFailed    bool
 	solutionFailure   solutionStage
+	solutionCanRetry  bool
 	tokenFile         string
 	token             string
 	tokenInput        string
@@ -276,8 +277,11 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.completeSolutionStage(msg.stage)
 			m.solutionFailed = true
 			m.solutionFailure = msg.stage
+			var sshError *remote.CommandError
+			m.solutionCanRetry = errors.As(msg.err, &sshError) && sshError.ExitCode == 255 && sshError.BeforeCommand &&
+				(msg.stage == solutionPrepareAnsible || msg.stage == solutionApplyInfra || msg.stage == solutionApplyIncident)
 			m.busy = false
-			if msg.stage == solutionOpenTerminal {
+			if msg.stage == solutionOpenTerminal || m.solutionCanRetry {
 				m.adoptSolutionConnection(msg.run)
 			} else if msg.run.cleanup != nil {
 				msg.run.cleanup()
@@ -298,6 +302,9 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = serverBusyMessage
 			} else {
 				m.status = "Ошибка: " + msg.err.Error()
+			}
+			if m.solutionCanRetry {
+				m.status += ". Нажмите p, чтобы повторить этап на той же VM."
 			}
 			m.logs = msg.run.output.String()
 			return m, nil
@@ -474,6 +481,9 @@ func (m tuiModel) updateKey(key string) (tea.Model, tea.Cmd) {
 		case "v":
 			return m.verifySolution()
 		case "p":
+			if m.solutionFailed && m.solutionCanRetry && m.solution != nil {
+				return m.retryUnstartedStage()
+			}
 			if m.solutionFailed && m.solutionFailure == solutionOpenTerminal && m.solution != nil {
 				return m.retryWebTerminal()
 			}
@@ -578,6 +588,7 @@ func (m tuiModel) startSolution() (tea.Model, tea.Cmd) {
 	m.solutionDurations = [solutionStageCount]time.Duration{}
 	m.solutionDone = [solutionStageCount]bool{}
 	m.solutionFailed = false
+	m.solutionCanRetry = false
 	m.screen, m.busy, m.logs = screenSolution, true, ""
 	m.startSolutionStage(solutionCheckCapabilities, "Проверяю токен…")
 	return m, tea.Batch(run.checkCapabilitiesCmd(), spinnerTickCmd())
@@ -687,6 +698,25 @@ func (m tuiModel) retryIncidentCheck() (tea.Model, tea.Cmd) {
 		}
 		return run.verifyIncidentCmd()()
 	}, spinnerTickCmd())
+}
+
+func (m tuiModel) retryUnstartedStage() (tea.Model, tea.Cmd) {
+	stage := m.solutionFailure
+	var command tea.Cmd
+	switch stage {
+	case solutionPrepareAnsible:
+		command = m.solution.prepareAnsibleCmd()
+	case solutionApplyInfra:
+		command = m.solution.applyInfraCmd()
+	case solutionApplyIncident:
+		command = m.solution.applyIncidentCmd()
+	default:
+		return m, nil
+	}
+	m.busy, m.solutionFailed, m.solutionCanRetry = true, false, false
+	m.solutionDone[stage] = false
+	m.startSolutionStage(stage, "Повторяю подключение и незапущенный этап на той же VM…")
+	return m, tea.Batch(command, spinnerTickCmd())
 }
 
 func isSSHTransportFailure(err error) bool {
@@ -1061,6 +1091,9 @@ func (m tuiModel) viewSolution(width int) string {
 	}
 	if m.solutionFailed && m.solutionFailure == solutionOpenTerminal {
 		content += "\n" + mutedStyle.Render("p повторить открытие веб-терминала   o открыть SSH-терминал   c команда SSH")
+	}
+	if m.solutionFailed && m.solutionCanRetry {
+		content += "\n" + mutedStyle.Render("p повторить незапущенный этап на той же VM")
 	}
 	return panelStyle.Width(max(30, width-4)).Render(content)
 }

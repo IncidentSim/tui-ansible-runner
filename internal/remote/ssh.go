@@ -9,14 +9,17 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"incidentctl/internal/vm"
 )
 
 type Client struct {
-	config vm.Connection
-	out    io.Writer
-	errOut io.Writer
+	config         vm.Connection
+	out            io.Writer
+	errOut         io.Writer
+	attemptCommand func(string, string) *exec.Cmd
+	retrySleep     func(time.Duration)
 }
 
 func New(cfg vm.Connection) *Client {
@@ -32,7 +35,9 @@ func NewWithWriters(cfg vm.Connection, out, errOut io.Writer) *Client {
 // CommandError reports a non-zero exit status returned by the remote command.
 // Transport errors (for example, failing to start ssh) use a different error.
 type CommandError struct {
-	ExitCode int
+	ExitCode      int
+	BeforeCommand bool
+	Attempts      int
 }
 
 func (e *CommandError) Error() string {
@@ -46,22 +51,14 @@ func IsCommandError(err error) bool {
 
 func (c *Client) RunScriptOutput(script string, args ...string) (string, error) {
 	var output bytes.Buffer
-	cmd := c.command(c.scriptCommand(args...))
-	cmd.Stdin = strings.NewReader(script)
-	cmd.Stdout = &output
-	cmd.Stderr = c.errOut
-	if err := describe(cmd.Run()); err != nil {
+	if err := c.run(c.scriptCommand(args...), func() (io.Reader, error) { return strings.NewReader(script), nil }, &output); err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(output.String()), nil
 }
 
 func (c *Client) RunScript(script string, args ...string) error {
-	cmd := c.command(c.scriptCommand(args...))
-	cmd.Stdin = strings.NewReader(script)
-	cmd.Stdout = c.out
-	cmd.Stderr = c.errOut
-	return describe(cmd.Run())
+	return c.run(c.scriptCommand(args...), func() (io.Reader, error) { return strings.NewReader(script), nil }, c.out)
 }
 
 func (c *Client) RunShellInput(script string, input io.Reader, args ...string) error {
@@ -71,11 +68,12 @@ func (c *Client) RunShellInput(script string, input io.Reader, args ...string) e
 }
 
 func (c *Client) RunWithInput(input io.Reader, command ...string) error {
-	cmd := c.command(joinCommand(command))
-	cmd.Stdin = input
-	cmd.Stdout = c.out
-	cmd.Stderr = c.errOut
-	return describe(cmd.Run())
+	open, cleanup, err := replayInput(input)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	return c.run(joinCommand(command), open, c.out)
 }
 
 func (c *Client) scriptCommand(args ...string) string {
@@ -89,8 +87,8 @@ func (c *Client) command(remoteCommand string) *exec.Cmd {
 	args := []string{
 		"-p", strconv.Itoa(c.config.Port),
 		"-o", "BatchMode=yes",
-		"-o", "ConnectTimeout=10",
-		"-o", "ConnectionAttempts=3",
+		"-o", "ConnectTimeout=30",
+		"-o", "ConnectionAttempts=1",
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=2",
 	}

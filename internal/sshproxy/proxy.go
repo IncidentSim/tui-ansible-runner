@@ -167,7 +167,7 @@ func socksConnect(conn net.Conn, reader io.Reader, host string, port int) error 
 // Relay connects OpenSSH's stdin/stdout to the proxy tunnel. Only diagnostics
 // belong on stderr; stdout must remain an unmodified SSH byte stream.
 func Relay(ctx context.Context, value, host string, port int, input io.Reader, output io.Writer) error {
-	conn, err := Dial(ctx, value, host, port, 10*time.Second)
+	conn, err := Dial(ctx, value, host, port, 20*time.Second)
 	if err != nil {
 		return err
 	}
