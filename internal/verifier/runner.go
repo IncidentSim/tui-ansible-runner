@@ -414,7 +414,7 @@ if [ -d "$target/collections/ansible_collections" ]; then export ANSIBLE_COLLECT
 timeout --kill-after=10s "$timeout_seconds" ansible-playbook --inventory 'localhost,' --connection local "$playbook" "$@"
 `
 
-const fetchScript =`set -euo pipefail
+const fetchScript = `set -euo pipefail
 file="$1/.verify/$2/$3/report.json"; max="$4"
 if [ ! -f "$file" ]; then echo "verifier produced no report" >&2; exit 66; fi
 size="$(stat -c %s "$file")"

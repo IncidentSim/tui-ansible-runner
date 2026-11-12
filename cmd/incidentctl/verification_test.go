@@ -207,21 +207,111 @@ func TestAuditResumeFailureAfterPassingReportIsNotARejection(t *testing.T) {
 
 func TestAuditDoesNotStartLLMWhenRecordingCouldNotResume(t *testing.T) {
 	client := &fakeAuditClient{packet: `{"session":"attempt-1"}`, startErr: errors.New("ssh down")}
-	a := auditOptions{ReportsDir: t.TempDir(), LLMConfig: "configured", Python: "missing-python", AgentDir: t.TempDir()}
+	// A real (test-binary) standalone agent that would succeed if it were started.
+	a := integrationAuditOptions(t)
 	warned := false
 	a.OnWarning = func(string) { warned = true } // only reached when analysis was attempted
 	var output bytes.Buffer
-	err := a.verifyResult(client, "/work", "example", t.TempDir(), &output, func(io.Writer) (*verifier.Result, error) { return nil, nil })
+	passed := passedResult(t, "example")
+	err := a.verifyResult(client, "/work", "example", integrationTaskDir(t), &output, func(io.Writer) (*verifier.Result, error) { return passed, nil })
 	var resumeErr *recordingResumeError
-	if !errors.As(err, &resumeErr) {
-		t.Fatalf("resume failure must be reported: %v", err)
+	if !errors.As(err, &resumeErr) || isRejectedVerification(err) {
+		t.Fatalf("resume failure must be reported as a technical error: %v", err)
 	}
-	if warned || strings.Contains(output.String(), "LLM") && !strings.Contains(output.String(), "не запускался") {
+	if warned || !strings.Contains(output.String(), "не запускался") {
 		t.Fatalf("LLM analysis started although recording was not resumed: %s", output.String())
 	}
-	entries, _ := os.ReadDir(filepath.Join(a.LLMReportsDir))
-	if len(entries) != 0 {
-		t.Fatal("a postmortem directory was reserved")
+	if reports, _ := filepath.Glob(filepath.Join(a.LLMReportsDir, "*", "*")); len(reports) != 0 {
+		t.Fatalf("a postmortem was produced or reserved: %v", reports)
+	}
+	// the evidence of the attempt is still saved for a manual retry
+	if saved, _ := filepath.Glob(filepath.Join(a.ReportsDir, "example-*", "verification-report.json")); len(saved) != 1 {
+		t.Fatalf("verification report was not persisted: %v", saved)
+	}
+	if got := strings.Join(client.operations, ","); got != "stop,start" {
+		t.Fatalf("operations = %s", got)
+	}
+}
+
+func integrationAuditOptions(t *testing.T) auditOptions {
+	t.Helper()
+	a := defaultAuditOptions()
+	a.Binary, _ = os.Executable() // TestMain turns the test binary into the standalone agent
+	a.ReportsDir, a.LLMReportsDir = t.TempDir(), t.TempDir()
+	a.LLMConfig = "local-profile.json"
+	return a
+}
+
+func integrationTaskDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("Exercise goal"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func passedResult(t *testing.T, name string) *verifier.Result {
+	t.Helper()
+	raw := []byte(`{"schema":"incidentsim.verify/v1","scenario":"` + name + `","attempt_id":"ABCDEFGHIJKLMNOPQRSTUVWXYZ","complete":true,"status":"pass","checks":[{"id":"a","status":"pass"}]}`)
+	var report verifier.Report
+	if err := json.Unmarshal(raw, &report); err != nil {
+		t.Fatal(err)
+	}
+	return &verifier.Result{AttemptID: report.AttemptID, Report: report, Raw: raw}
+}
+
+// Seam test: structured report contract + standalone Go agent. The analyzer is
+// started only after a passed report and a successful resume, and it receives
+// the validation.json that embeds the validated report.
+func TestAuditStandaloneAgentReceivesValidatedReportAfterResume(t *testing.T) {
+	client := &fakeAuditClient{packet: `{"session":"attempt-1"}`}
+	a := integrationAuditOptions(t)
+	var output bytes.Buffer
+	err := a.verifyResult(client, "/work", "example", integrationTaskDir(t), &output, func(io.Writer) (*verifier.Result, error) {
+		if got := strings.Join(client.operations, ","); got != "stop" {
+			t.Fatalf("verifier must run while recording is stopped: %s", got)
+		}
+		return passedResult(t, "example"), nil
+	})
+	if err != nil {
+		t.Fatalf("%v\n%s", err, output.String())
+	}
+	if got := strings.Join(client.operations, ","); got != "stop,start" {
+		t.Fatalf("operations = %s", got)
+	}
+	if _, err := os.Stat(filepath.Join(a.LLMReportsDir, "example", "1", "analysis.md")); err != nil {
+		t.Fatalf("analysis was not produced: %v\n%s", err, output.String())
+	}
+	validations, _ := filepath.Glob(filepath.Join(a.ReportsDir, "example-*", "validation.json"))
+	if len(validations) != 1 {
+		t.Fatalf("validation files: %v", validations)
+	}
+	data, _ := os.ReadFile(validations[0])
+	var validation struct {
+		Passed bool            `json:"passed"`
+		Status string          `json:"status"`
+		Report json.RawMessage `json:"report"`
+	}
+	if err := json.Unmarshal(data, &validation); err != nil || !validation.Passed || validation.Status != "pass" || !strings.Contains(string(validation.Report), "incidentsim.verify/v1") {
+		t.Fatalf("the analyzer's input lacks the report contract: %s %v", data, err)
+	}
+}
+
+func TestAuditRejectedReportDoesNotStartAgentButResumesRecording(t *testing.T) {
+	client := &fakeAuditClient{packet: `{"session":"attempt-1"}`}
+	a := integrationAuditOptions(t)
+	result := passedResult(t, "example")
+	result.Report.Status = verifier.StatusFail
+	result.Report.Checks[0].Status = verifier.StatusFail
+	err := a.verifyResult(client, "/work", "example", integrationTaskDir(t), io.Discard, func(io.Writer) (*verifier.Result, error) {
+		return result, &verifier.RejectedError{Result: result}
+	})
+	if !isRejectedVerification(err) || strings.Join(client.operations, ",") != "stop,start" {
+		t.Fatalf("%v %v", err, client.operations)
+	}
+	if reports, _ := filepath.Glob(filepath.Join(a.LLMReportsDir, "*", "*")); len(reports) != 0 {
+		t.Fatalf("analysis ran for a rejected solution: %v", reports)
 	}
 }
 
