@@ -12,7 +12,7 @@ endif
 CONFIG ?= incidentctl.json
 COMMAND := ./cmd/incidentctl
 
-.PHONY: help config build run test vet fmt check clean
+.PHONY: help config audit-binaries build run test vet fmt check clean
 
 help:
 	@echo make config             create incidentctl.json from the example
@@ -31,17 +31,19 @@ else
 	@test -f "$(CONFIG)" || cp incidentctl.example.json "$(CONFIG)"
 endif
 
-build:
+audit-binaries:
 	$(GO) generate ./internal/auditbinary
+
+build: audit-binaries
 	$(GO) build -o "$(BINARY)" $(COMMAND)
 
 run: build
 	"$(RUN_BINARY)" -config "$(CONFIG)" $(ARGS)
 
-test:
+test: audit-binaries
 	$(GO) test ./...
 
-vet:
+vet: audit-binaries
 	$(GO) vet ./...
 
 fmt:
