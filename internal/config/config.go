@@ -64,6 +64,16 @@ type Exercise struct {
 	Resources     Resources       `json:"resources"`
 	Runtime       Runtime         `json:"runtime"`
 	Playbooks     ExerciseActions `json:"playbooks"`
+
+	// Root is the catalog directory containing the exercise; the shared
+	// verification collection lives in Root/collections.
+	Root string `json:"-"`
+	// Description comes from manifest.yaml (empty for legacy exercises).
+	Description string `json:"-"`
+	// Manifest is true when the exercise is described by manifest.yaml.
+	Manifest bool `json:"-"`
+	// Verification is the effective verification contract.
+	Verification Verification `json:"-"`
 }
 
 type Resources struct {
@@ -233,12 +243,38 @@ func LoadExercise(root, name string) (Exercise, string, error) {
 		return exercise, "", fmt.Errorf("invalid exercise name %q", name)
 	}
 	dir := filepath.Join(root, name)
-	if err := decode(filepath.Join(dir, "vm.json"), &exercise); err != nil {
+	environment := "vm.json"
+	var manifest ExerciseActions
+	var verification Verification
+	var description string
+	hasManifest := false
+	if _, err := os.Stat(filepath.Join(dir, ManifestFile)); err == nil {
+		doc, err := readManifest(filepath.Join(dir, ManifestFile))
+		if err != nil {
+			return exercise, dir, err
+		}
+		verification, environment, manifest, err = doc.build(name)
+		if err != nil {
+			return exercise, dir, err
+		}
+		description, hasManifest = doc.Description, true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return exercise, dir, fmt.Errorf("inspect %s: %w", ManifestFile, err)
+	}
+	if err := decode(filepath.Join(dir, filepath.FromSlash(environment)), &exercise); err != nil {
 		return exercise, dir, err
 	}
 	if exercise.Name != name {
-		return exercise, dir, fmt.Errorf("vm.json name must match directory name %q", name)
+		return exercise, dir, fmt.Errorf("%s name must match directory name %q", environment, name)
 	}
+	if hasManifest {
+		if err := mergePlaybooks(&exercise.Playbooks, manifest); err != nil {
+			return exercise, dir, err
+		}
+	} else {
+		verification.Playbook = exercise.Playbooks.Verification
+	}
+	exercise.Root, exercise.Description, exercise.Manifest, exercise.Verification = root, description, hasManifest, verification
 	if err := exercise.Validate(dir); err != nil {
 		return exercise, dir, err
 	}

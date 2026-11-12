@@ -119,11 +119,17 @@ func listCatalog(ctx context.Context, root string) ([]Item, error) {
 		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
-		if _, err := os.Stat(filepath.Join(root, entry.Name(), "vm.json")); err != nil {
-			if os.IsNotExist(err) {
-				continue
+		found := false
+		for _, marker := range []string{"vm.json", config.ManifestFile} {
+			if _, err := os.Stat(filepath.Join(root, entry.Name(), marker)); err == nil {
+				found = true
+				break
+			} else if !os.IsNotExist(err) {
+				return nil, fmt.Errorf("inspect exercise %s: %w", entry.Name(), err)
 			}
-			return nil, fmt.Errorf("inspect exercise %s: %w", entry.Name(), err)
+		}
+		if !found {
+			continue
 		}
 		items = append(items, loadCatalogItemUnchecked(root, entry.Name()))
 	}
