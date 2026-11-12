@@ -35,6 +35,9 @@ func (f *fakeVerifyClient) RunShellInputContext(_ context.Context, script string
 }
 func (f *fakeVerifyClient) RunScriptContext(_ context.Context, _ string, _ ...string) error {
 	f.calls = append(f.calls, "script")
+	if f.status != verifier.StatusPass {
+		return &remote.CommandError{ExitCode: 2} // a failed check fails the play
+	}
 	return nil
 }
 func (f *fakeVerifyClient) RunScriptOutputContext(_ context.Context, _ string, args ...string) (string, error) {
@@ -178,6 +181,26 @@ func TestAuditResumeFailureAfterPassingReportIsNotARejection(t *testing.T) {
 	})
 	if err == nil || isRejectedVerification(err) {
 		t.Fatalf("audit start failure became a rejected solution: %v", err)
+	}
+}
+
+func TestAuditDoesNotStartLLMWhenRecordingCouldNotResume(t *testing.T) {
+	client := &fakeAuditClient{packet: `{"session":"attempt-1"}`, startErr: errors.New("ssh down")}
+	a := auditOptions{ReportsDir: t.TempDir(), LLMConfig: "configured", Python: "missing-python", AgentDir: t.TempDir()}
+	warned := false
+	a.OnWarning = func(string) { warned = true } // only reached when analysis was attempted
+	var output bytes.Buffer
+	err := a.verifyResult(client, "/work", "example", t.TempDir(), &output, func(io.Writer) (*verifier.Result, error) { return nil, nil })
+	var resumeErr *recordingResumeError
+	if !errors.As(err, &resumeErr) {
+		t.Fatalf("resume failure must be reported: %v", err)
+	}
+	if warned || strings.Contains(output.String(), "LLM") && !strings.Contains(output.String(), "не запускался") {
+		t.Fatalf("LLM analysis started although recording was not resumed: %s", output.String())
+	}
+	entries, _ := os.ReadDir(filepath.Join(a.LLMReportsDir))
+	if len(entries) != 0 {
+		t.Fatal("a postmortem directory was reserved")
 	}
 }
 

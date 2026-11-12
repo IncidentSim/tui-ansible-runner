@@ -183,7 +183,7 @@ func (a auditOptions) verifyResult(client auditClient, work, name, dir string, o
 		return errors.Join(verifyErr, resumeErr, err)
 	}
 	fmt.Fprintf(output, "\nЛоги проверенной попытки сохранены: %s\n", report)
-	if a.llmEnabled() && verifyErr == nil {
+	if a.llmEnabled() && verifyErr == nil && resumeErr == nil {
 		if err := a.analyzeReport(report, name, dir, output); err != nil {
 			warning := "Проверка с помощью LLM не удалась. Использован результат Ansible-проверки."
 			fmt.Fprintf(output, "\nПредупреждение: %s\nПричина: %v\nЛоги сохранены: %s\n", warning, err, report)
@@ -191,6 +191,8 @@ func (a auditOptions) verifyResult(client auditClient, work, name, dir string, o
 				a.OnWarning(warning)
 			}
 		}
+	} else if a.llmEnabled() && resumeErr != nil {
+		fmt.Fprintln(output, "Анализ LLM не запускался: запись пользовательских событий не была возобновлена.")
 	} else if a.llmEnabled() {
 		fmt.Fprintln(output, "Анализ LLM не запускался: Ansible-проверка ещё не пройдена.")
 	}
